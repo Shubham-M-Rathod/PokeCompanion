@@ -39,10 +39,10 @@ from src.core.items import get_item_name
 
 class BridgeSignals(QObject):
     state_updated = Signal()
-    players_updated = Signal(list)
-    challenge_received = Signal(str, str, dict)
+    players_updated = Signal(object)
+    challenge_received = Signal(str, str, object)
     battle_ready = Signal(str, bytes)
-    ledger_updated = Signal(dict)
+    ledger_updated = Signal(object)
     connection_status = Signal(str, str)  # component, status
 
 
@@ -326,3 +326,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

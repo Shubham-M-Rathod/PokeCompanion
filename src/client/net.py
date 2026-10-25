@@ -49,9 +49,22 @@ class NetworkEngine:
             await self.ws.close()
             self.ws = None
 
+    @property
+    def is_connected(self) -> bool:
+        if not self.ws:
+            return False
+        # Modern websockets (v14+)
+        if hasattr(self.ws, "state"):
+            return getattr(self.ws.state, "name", "") == "OPEN"
+        # Legacy websockets (<v14)
+        return getattr(self.ws, "open", True) and not getattr(self.ws, "closed", False)
+
     async def _send(self, msg: NetworkMessage):
-        if self.ws and not self.ws.closed:
-            await self.ws.send(msg.model_dump_json())
+        if self.is_connected and self.ws:
+            try:
+                await self.ws.send(msg.model_dump_json())
+            except Exception as e:
+                logger.warning("Error sending message: %s", e)
 
     async def sync_state(self):
         """Builds player summary from state and transmits SYNC_STATE to server."""
@@ -189,3 +202,4 @@ class NetworkEngine:
             logger.info("WebSocket connection closed.")
         except Exception as e:
             logger.error("Error in network listen loop: %s", e)
+
