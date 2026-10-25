@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# ROMs & Saves (do not commit ROMs or personal saves)
+roms/
+*.gba
+*.sav
+*.ss*
+
+# Logs & temp
+*.log
+.pytest_cache/
+.coverage
+
