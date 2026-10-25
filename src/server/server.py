@@ -208,3 +208,4 @@ async def websocket_endpoint(websocket: WebSocket, player_id: str):
     except Exception as e:
         logger.error("WebSocket error for %s: %s", player_id, e)
         await manager.disconnect(player_id)
+

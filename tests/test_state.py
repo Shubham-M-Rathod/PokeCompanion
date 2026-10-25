@@ -47,3 +47,4 @@ def test_parse_bag_pocket():
     assert len(items) == 2
     assert items[0] == (0x000D, 10, "Potion")
     assert items[1] == (0x0004, 5, "Poké Ball")
+

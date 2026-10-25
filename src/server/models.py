@@ -48,3 +48,4 @@ class NetworkMessage(BaseModel):
     sender_id: str
     target_id: Optional[str] = None
     payload: Dict[str, Any] = Field(default_factory=dict)
+

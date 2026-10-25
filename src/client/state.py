@@ -16,8 +16,10 @@ from src.core.constants import (
     PARTY_SLOTS_COUNT,
     FireRedOffsets,
     EmeraldOffsets,
+    SUBSTRUCT_ORDER,
 )
 from src.core.pokemon import Pokemon, decode_gen3_string
+from src.core.crypto import calculate_checksum, decrypt_substructs
 from src.core.items import get_item_name
 from src.memory.gdb_client import GDBClient
 
@@ -48,28 +50,66 @@ def parse_trainer_header(header_bytes: bytes) -> Tuple[str, int, int]:
     return name, tid, sid
 
 
-def parse_bag_pocket(raw_bag: bytes, capacity: int) -> List[Tuple[int, int, str]]:
-    """Parses an array of [u16 item_id, u16 quantity] from Bag Pocket RAM."""
+def parse_bag_pocket(raw_bag: bytes, capacity: int, security_key: int = 0) -> List[Tuple[int, int, str]]:
+    """Parses an array of [u16 item_id, u16 quantity] from Bag Pocket RAM, handling XOR obfuscation."""
     items = []
+    xor_mask = security_key & 0xFFFF
+
     for i in range(capacity):
         chunk = raw_bag[i * 4 : (i + 1) * 4]
         if len(chunk) < 4:
             break
-        item_id, qty = struct.unpack("<HH", chunk)
-        if item_id != 0 and qty > 0:
-            items.append((item_id, qty, get_item_name(item_id)))
+        item_id, raw_qty = struct.unpack("<HH", chunk)
+        if item_id == 0:
+            continue
+
+        # Valid item IDs in Gen 3 are 1..375
+        if not (1 <= item_id <= 375):
+            continue
+
+        # Decrypt quantity using security key if applicable
+        qty = raw_qty ^ xor_mask
+        if not (1 <= qty <= 999):
+            # Fallback to raw quantity if XOR produces invalid value
+            if 1 <= raw_qty <= 999:
+                qty = raw_qty
+            else:
+                continue
+
+        items.append((item_id, qty, get_item_name(item_id)))
     return items
 
 
-def parse_party_data(raw_party: bytes) -> List[Pokemon]:
-    """Parses up to 6 Pokemon slots from 600 bytes of party RAM."""
+def verify_pokemon_checksum(mon: Pokemon) -> bool:
+    """Recalculates and verifies the 16-bit additive checksum of the 48-byte substructs."""
+    if not mon.is_valid() or len(mon.raw_data) < PARTY_SLOT_SIZE:
+        return False
+    
+    raw_substructs = mon.raw_data[32:80]
+    g, a, e, m = decrypt_substructs(raw_substructs, mon.pid, mon.otid)
+    
+    order = SUBSTRUCT_ORDER[mon.pid % 24]
+    canonical = [g, a, e, m]
+    ordered_decrypted = bytearray(48)
+    for pos, blk_idx in enumerate(order):
+        ordered_decrypted[pos * 12 : (pos + 1) * 12] = canonical[blk_idx]
+
+    calc_csum = calculate_checksum(bytes(ordered_decrypted))
+    return calc_csum == mon.checksum
+
+
+def parse_party_data(raw_party: bytes, party_count: int) -> List[Pokemon]:
+    """Parses only the active Pokemon slots (up to party_count) and validates checksums."""
     party = []
-    for slot_idx in range(PARTY_SLOTS_COUNT):
+    if not (1 <= party_count <= 6):
+        return []
+
+    for slot_idx in range(party_count):
         offset = slot_idx * PARTY_SLOT_SIZE
         slot_bytes = raw_party[offset : offset + PARTY_SLOT_SIZE]
         if len(slot_bytes) == PARTY_SLOT_SIZE:
             mon = Pokemon.from_bytes(slot_bytes)
-            if mon.is_valid():
+            if mon.is_valid() and verify_pokemon_checksum(mon):
                 party.append(mon)
     return party
 
@@ -83,13 +123,15 @@ class GameStateManager:
         self.offsets = FireRedOffsets
 
         # Cached Game State
+        self.party_count: int = 0
         self.player_name: str = "Trainer"
         self.trainer_id: int = 0
         self.secret_id: int = 0
+        self.security_key: int = 0
         self.badge_byte: int = 0
         self.badges: List[bool] = [False] * 8
         self.party: List[Pokemon] = []
-        self.bag_items: List[Tuple[int, int, str]] = []  # (item_id, qty, name)
+        self.bag_items: List[Tuple[int, int, str]] = []
         self.raw_party_bytes: bytes = b"\x00" * TOTAL_PARTY_SIZE
 
     async def detect_game_version(self) -> str:
@@ -111,11 +153,12 @@ class GameStateManager:
         return self.game_code
 
     async def poll_trainer_info(self) -> None:
-        """Reads SaveBlock2 for player name and trainer ID."""
+        """Reads SaveBlock2 for player name, trainer ID, and security key."""
         try:
             sb2_ptr_bytes = await self.gdb.read_memory(self.offsets.SAVE_BLOCK_2_PTR, 4)
             sb2_addr = struct.unpack("<I", sb2_ptr_bytes)[0]
-            if sb2_addr < 0x02000000 or sb2_addr > 0x03007FFF:
+            # Valid EWRAM pointer range on GBA
+            if sb2_addr < 0x02000000 or sb2_addr > 0x0203E000:
                 return
 
             header_bytes = await self.gdb.read_memory(sb2_addr, 16)
@@ -124,6 +167,11 @@ class GameStateManager:
                 self.player_name = name
             self.trainer_id = tid
             self.secret_id = sid
+
+            # Read security key at SaveBlock2 + SECURITY_KEY_OFFSET
+            key_addr = sb2_addr + self.offsets.SECURITY_KEY_OFFSET
+            key_bytes = await self.gdb.read_memory(key_addr, 4)
+            self.security_key = struct.unpack("<I", key_bytes)[0]
         except Exception as e:
             logger.debug("Could not read trainer info: %s", e)
 
@@ -132,7 +180,7 @@ class GameStateManager:
         try:
             sb1_ptr_bytes = await self.gdb.read_memory(self.offsets.SAVE_BLOCK_1_PTR, 4)
             sb1_addr = struct.unpack("<I", sb1_ptr_bytes)[0]
-            if sb1_addr < 0x02000000 or sb1_addr > 0x03007FFF:
+            if sb1_addr < 0x02000000 or sb1_addr > 0x0203E000:
                 return
 
             badge_addr = sb1_addr + self.offsets.BADGE_FLAGS_OFFSET
@@ -143,48 +191,69 @@ class GameStateManager:
             logger.debug("Could not read badges: %s", e)
 
     async def poll_party(self) -> List[Pokemon]:
-        """Reads and decrypts all 6 player party slots (FR-3)."""
-        raw_party = await self.gdb.read_memory(self.offsets.PLAYER_PARTY, TOTAL_PARTY_SIZE)
-        self.raw_party_bytes = raw_party
-        self.party = parse_party_data(raw_party)
-        return self.party
+        """Reads gPlayerPartyCount and decrypts only active party slots with checksum checks."""
+        try:
+            # 1. Read single byte gPlayerPartyCount at 0x02024029
+            count_data = await self.gdb.read_memory(self.offsets.PLAYER_PARTY_COUNT, 1)
+            party_count = count_data[0]
+            if party_count > 6:
+                # Game is at title screen or in transition
+                self.party_count = 0
+                self.party = []
+                return []
+            self.party_count = party_count
+
+            if party_count == 0:
+                self.party = []
+                return []
+
+            # 2. Read full 600 bytes
+            raw_party = await self.gdb.read_memory(self.offsets.PLAYER_PARTY, TOTAL_PARTY_SIZE)
+            self.raw_party_bytes = raw_party
+            self.party = parse_party_data(raw_party, party_count)
+            return self.party
+        except Exception as e:
+            logger.debug("Error reading party: %s", e)
+            return []
 
     async def poll_bag(self) -> List[Tuple[int, int, str]]:
-        """Reads inventory pocket from SaveBlock1."""
+        """Reads inventory pocket from SaveBlock1 using security key."""
         try:
             sb1_ptr_bytes = await self.gdb.read_memory(self.offsets.SAVE_BLOCK_1_PTR, 4)
             sb1_addr = struct.unpack("<I", sb1_ptr_bytes)[0]
-            if sb1_addr < 0x02000000 or sb1_addr > 0x03007FFF:
+            if sb1_addr < 0x02000000 or sb1_addr > 0x0203E000:
                 return []
 
             bag_addr = sb1_addr + self.offsets.BAG_POCKET_OFFSET
             pocket_capacity = self.offsets.BAG_ITEMS_COUNT
             raw_bag = await self.gdb.read_memory(bag_addr, pocket_capacity * 4)
-            self.bag_items = parse_bag_pocket(raw_bag, pocket_capacity)
+            self.bag_items = parse_bag_pocket(raw_bag, pocket_capacity, self.security_key)
             return self.bag_items
         except Exception as e:
             logger.debug("Could not read bag items: %s", e)
             return []
 
     async def update_all(self) -> None:
-        """Executes a full polling cycle (Party, Badges, Bag, Trainer)."""
-        if not self.game_code:
-            await self.detect_game_version()
+        """Executes a full polling cycle inside a single non-blocking GDB transaction."""
+        async with self.gdb.transaction():
+            if not self.game_code:
+                await self.detect_game_version()
 
-        await self.poll_party()
-        await self.poll_trainer_info()
-        await self.poll_badges()
-        await self.poll_bag()
+            await self.poll_trainer_info()
+            await self.poll_party()
+            await self.poll_badges()
+            await self.poll_bag()
 
     async def inject_opponent_party(self, opponent_party_600_bytes: bytes) -> bool:
         """Injects a 600-byte party into Opponent Party RAM (FR-5)."""
         if len(opponent_party_600_bytes) != TOTAL_PARTY_SIZE:
             raise ValueError(f"Opponent party payload must be {TOTAL_PARTY_SIZE} bytes.")
 
-        target_addr = self.offsets.OPPONENT_PARTY
-        success = await self.gdb.write_memory(target_addr, opponent_party_600_bytes)
-        if success:
-            logger.info("Successfully injected opponent party (%d bytes) to 0x%08X", len(opponent_party_600_bytes), target_addr)
-        else:
-            logger.error("Failed to inject opponent party to 0x%08X", target_addr)
-        return success
+        async with self.gdb.transaction():
+            target_addr = self.offsets.OPPONENT_PARTY
+            success = await self.gdb.write_memory(target_addr, opponent_party_600_bytes)
+            if success:
+                logger.info("Successfully injected opponent party (%d bytes) to 0x%08X", len(opponent_party_600_bytes), target_addr)
+            else:
+                logger.error("Failed to inject opponent party to 0x%08X", target_addr)
+            return success

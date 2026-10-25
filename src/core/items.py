@@ -54,3 +54,4 @@ ITEM_NAMES = {
 
 def get_item_name(item_id: int) -> str:
     return ITEM_NAMES.get(item_id, f"Item #{item_id}")
+

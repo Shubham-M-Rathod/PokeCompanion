@@ -80,10 +80,11 @@ class MainWindow(QMainWindow):
         # Build UI
         self._setup_ui()
 
-        # Polling Timer for RAM Inspection (Every 400ms)
+        # Polling Guard & Timer for RAM Inspection
+        self._is_polling = False
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._schedule_poll)
-        self.poll_timer.start(400)
+        self.poll_timer.start(800)
 
         # Connect to mGBA and Relay Server
         asyncio.run_coroutine_threadsafe(self._init_connections(), self.loop)
@@ -109,7 +110,8 @@ class MainWindow(QMainWindow):
             self.signals.connection_status.emit("RELAY", f"Offline ({e})")
 
     def _schedule_poll(self):
-        if self.gdb.is_connected:
+        if self.gdb.is_connected and not self._is_polling:
+            self._is_polling = True
             asyncio.run_coroutine_threadsafe(self._do_poll(), self.loop)
 
     async def _do_poll(self):
@@ -120,6 +122,8 @@ class MainWindow(QMainWindow):
                 await self.net.sync_state()
         except Exception as e:
             pass
+        finally:
+            self._is_polling = False
 
     def _setup_ui(self):
         central = QWidget()
@@ -216,9 +220,11 @@ class MainWindow(QMainWindow):
     def _render_state(self):
         # Update Trainer Header
         badge_count = sum(self.state_mgr.badges)
-        self.lbl_trainer_info.setText(
-            f"Trainer: {self.state_mgr.player_name} | ID: {self.state_mgr.trainer_id:05d} | Badges: {badge_count}/8"
-        )
+        if self.state_mgr.trainer_id == 0 and not self.state_mgr.party:
+            trainer_text = "Trainer: [Waiting for Save to Load in mGBA] | Badges: 0/8"
+        else:
+            trainer_text = f"Trainer: {self.state_mgr.player_name} | ID: {self.state_mgr.trainer_id:05d} | Badges: {badge_count}/8"
+        self.lbl_trainer_info.setText(trainer_text)
 
         # Update 6 Party Slots
         for i in range(6):
@@ -233,7 +239,7 @@ class MainWindow(QMainWindow):
                 widgets["moves"].setText(f"Moves: {mon.moves}")
                 widgets["ivs"].setText(f"IVs: H{mon.hp_iv} A{mon.atk_iv} D{mon.def_iv} S{mon.spd_iv}")
             else:
-                widgets["name"].setText("Empty Slot")
+                widgets["name"].setText(f"Slot {i+1} (Empty)")
                 widgets["hp_bar"].setValue(0)
                 widgets["stats"].setText("Lv: -- | HP: --/--")
                 widgets["moves"].setText("Moves: --")

@@ -45,3 +45,4 @@ def test_escrow_ledger_logic():
     req_qty = 5
     can_withdraw = manager.cloud_ledger.get(test_item, 0) >= req_qty
     assert can_withdraw is False
+
