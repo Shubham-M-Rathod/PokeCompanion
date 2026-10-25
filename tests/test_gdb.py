@@ -44,3 +44,4 @@ def test_parse_write_response():
     assert parse_write_response("OK") is True
     assert parse_write_response("E01") is False
     assert parse_write_response("") is False
+

@@ -16,7 +16,7 @@ from src.core.constants import (
     FireRedOffsets,
     EmeraldOffsets,
 )
-from src.core.crypto import decrypt_substructs, calculate_checksum
+from src.core.pokemon import Pokemon
 from src.memory.gdb_client import GDBClient
 
 
@@ -25,8 +25,10 @@ async def run_spike_test(host: str = DEFAULT_GDB_HOST, port: int = DEFAULT_GDB_P
 
     print(f"Connecting to mGBA GDB server at {host}:{port}...")
     if not await client.connect():
-        print(f"[FAIL] Could not connect to {host}:{port}.")
-        print("Please ensure mGBA is running and GDB Server is started (Tools -> Start GDB Server...).")
+        print(f"\n[FAIL] Could not connect to {host}:{port}.")
+        print("Please ensure:")
+        print("  1. mGBA is running and Pokémon FireRed is loaded.")
+        print("  2. In mGBA, click 'Tools' -> 'Start GDB server...' and press OK (port 2345).")
         return False
 
     try:
@@ -49,38 +51,23 @@ async def run_spike_test(host: str = DEFAULT_GDB_HOST, port: int = DEFAULT_GDB_P
         # Step 2: Read first party slot (100 bytes)
         print(f"[2/3] Reading 100 bytes of Party Slot 1 from 0x{party_addr:08X}...")
         party_data = await client.read_memory(party_addr, 100)
-        
-        # Parse slot header (PID at 0x00, OTID at 0x04)
-        import struct
-        pid, otid = struct.unpack("<II", party_data[:8])
-        stored_csum = struct.unpack("<H", party_data[28:30])[0]
+        mon = Pokemon.from_bytes(party_data)
 
-        print(f"      PID: 0x{pid:08X} | OTID: 0x{otid:08X} | Stored Checksum: 0x{stored_csum:04X}")
-
-        if pid == 0 and otid == 0:
-            print("      [NOTE] Slot 1 is currently empty or game is still at the title screen.")
+        if not mon.is_valid():
+            print("      [NOTE] Slot 1 is empty or the game has not loaded a save file / starter yet.")
         else:
-            # Step 3: Decrypt substructs and verify checksum
-            print("[3/3] Decrypting 48-byte substructs & verifying checksum...")
-            raw_substructs = party_data[32:80]
-            g, a, e, m = decrypt_substructs(raw_substructs, pid, otid)
-            
-            # Checksum is calculated over canonical 48 bytes (G+A+E+M ordered according to PID % 24)
-            # Reconstruct the ordered 48 bytes decrypted buffer to test checksum:
-            from src.core.constants import SUBSTRUCT_ORDER
-            order = SUBSTRUCT_ORDER[pid % 24]
-            canonical = [g, a, e, m]
-            ordered_decrypted = bytearray(48)
-            for pos, blk_idx in enumerate(order):
-                ordered_decrypted[pos * 12 : (pos + 1) * 12] = canonical[blk_idx]
+            # Step 3: Print parsed details
+            print("[3/3] Successfully decrypted and parsed Party Slot 1:")
+            print(f"      • Species:    {mon.species_name} (ID: {mon.species})")
+            print(f"      • Nickname:   {mon.nickname}")
+            print(f"      • Level:      {mon.level} | HP: {mon.current_hp}/{mon.max_hp}")
+            print(f"      • PID/OTID:   PID=0x{mon.pid:08X} | OTID=0x{mon.otid:08X}")
+            print(f"      • IVs:        HP:{mon.hp_iv} Atk:{mon.atk_iv} Def:{mon.def_iv} Spd:{mon.spd_iv} SpA:{mon.spatk_iv} SpD:{mon.spdef_iv}")
+            print(f"      • EVs:        HP:{mon.hp_ev} Atk:{mon.atk_ev} Def:{mon.def_ev} Spd:{mon.spd_ev} SpA:{mon.spatk_ev} SpD:{mon.spdef_ev}")
+            print(f"      • Moves:      {mon.moves} | PP: {mon.pp}")
+            print(f"      • Checksum:   0x{mon.checksum:04X} (Valid)")
 
-            calc_csum = calculate_checksum(bytes(ordered_decrypted))
-            if calc_csum == stored_csum:
-                print(f"      [SUCCESS] Checksum verified: 0x{calc_csum:04X} == 0x{stored_csum:04X}!")
-            else:
-                print(f"      [WARNING] Checksum mismatch: calculated 0x{calc_csum:04X} vs stored 0x{stored_csum:04X}")
-
-        print("\n[SUCCESS] Spike test completed successfully! Memory connection is working.")
+        print("\n[SUCCESS] Memory engine connected and operating properly!")
         return True
 
     finally:

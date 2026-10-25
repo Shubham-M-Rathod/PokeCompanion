@@ -138,3 +138,4 @@ class GDBClient:
             cmd = f"M{address:x},{len(data):x}:{hex_data}"
             resp = await self._send_raw_packet(cmd)
             return parse_write_response(resp)
+

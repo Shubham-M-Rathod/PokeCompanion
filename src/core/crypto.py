@@ -90,3 +90,4 @@ def encrypt_substructs(
     
     key = (pid ^ otid) & 0xFFFFFFFF
     return xor_crypt(bytes(ordered_bytes), key)
+
