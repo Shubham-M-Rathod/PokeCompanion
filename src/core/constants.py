@@ -10,8 +10,10 @@ class FireRedOffsets:
     PLAYER_PARTY = 0x02024284   # 6 slots * 100 bytes = 600 bytes
     OPPONENT_PARTY = 0x0202402C # 6 slots * 100 bytes = 600 bytes
     SAVE_BLOCK_1_PTR = 0x03005008
+    SAVE_BLOCK_2_PTR = 0x0300500C # Contains Player Name, Gender, Trainer ID
     BADGE_FLAGS_OFFSET = 0x1450 # SaveBlock1 + 0x1450 (1 byte, 8 badge bits)
     BAG_POCKET_OFFSET = 0x0310  # SaveBlock1 + 0x0310 (Array of [u16 item_id, u16 quantity])
+    BAG_ITEMS_COUNT = 30        # FireRed items pocket capacity
 
 
 class EmeraldOffsets:
@@ -19,8 +21,10 @@ class EmeraldOffsets:
     PLAYER_PARTY = 0x020244EC
     OPPONENT_PARTY = 0x02024744
     SAVE_BLOCK_1_PTR = 0x03005D8C
+    SAVE_BLOCK_2_PTR = 0x03005D90
     BADGE_FLAGS_OFFSET = 0x1450
     BAG_POCKET_OFFSET = 0x0560
+    BAG_ITEMS_COUNT = 30
 
 
 # Gen 3 Pokémon Data Sizes
