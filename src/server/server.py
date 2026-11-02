@@ -40,7 +40,6 @@ class RelayManager:
             0x000D: 5,  # 5 Potions initial public pool
             0x0004: 10, # 10 Poké Balls initial public pool
         }
-        self.lock = asyncio.Lock()
 
     async def connect(self, player_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -100,9 +99,8 @@ class RelayManager:
 
     async def handle_deposit(self, player_id: str, item_id: int, quantity: int) -> bool:
         """Adds items into cloud escrow ledger."""
-        async with self.lock:
-            self.cloud_ledger[item_id] = self.cloud_ledger.get(item_id, 0) + quantity
-            logger.info("Player %s deposited item 0x%04X x%d. New balance: %d", player_id, item_id, quantity, self.cloud_ledger[item_id])
+        self.cloud_ledger[item_id] = self.cloud_ledger.get(item_id, 0) + quantity
+        logger.info("Player %s deposited item 0x%04X x%d. New balance: %d", player_id, item_id, quantity, self.cloud_ledger[item_id])
         await self.broadcast(
             NetworkMessage(
                 type=MessageType.LEDGER_UPDATE,
@@ -114,26 +112,36 @@ class RelayManager:
 
     async def handle_withdraw(self, player_id: str, item_id: int, quantity: int) -> bool:
         """Validates and withdraws items from cloud escrow ledger."""
-        async with self.lock:
-            current_qty = self.cloud_ledger.get(item_id, 0)
-            if current_qty < quantity:
-                logger.warning("Withdrawal rejected: insufficient item 0x%04X (requested %d, available %d)", item_id, quantity, current_qty)
-                await self.send_personal_message(
-                    NetworkMessage(
-                        type=MessageType.ESCROW_ERROR,
-                        sender_id="SERVER",
-                        target_id=player_id,
-                        payload={"error": "Insufficient item quantity in cloud ledger."},
-                    ),
-                    player_id,
-                )
-                return False
+        current_qty = self.cloud_ledger.get(item_id, 0)
+        if current_qty < quantity:
+            logger.warning("Withdrawal rejected: insufficient item 0x%04X (requested %d, available %d)", item_id, quantity, current_qty)
+            await self.send_personal_message(
+                NetworkMessage(
+                    type=MessageType.ESCROW_ERROR,
+                    sender_id="SERVER",
+                    target_id=player_id,
+                    payload={"error": "Insufficient item quantity in cloud ledger."},
+                ),
+                player_id,
+            )
+            return False
 
-            self.cloud_ledger[item_id] = current_qty - quantity
-            if self.cloud_ledger[item_id] == 0:
-                del self.cloud_ledger[item_id]
+        self.cloud_ledger[item_id] = current_qty - quantity
+        if self.cloud_ledger[item_id] == 0:
+            del self.cloud_ledger[item_id]
 
-            logger.info("Player %s withdrew item 0x%04X x%d.", player_id, item_id, quantity)
+        logger.info("Player %s withdrew item 0x%04X x%d.", player_id, item_id, quantity)
+
+        # Notify the withdrawing player of approval so they can inject into RAM
+        await self.send_personal_message(
+            NetworkMessage(
+                type=MessageType.CLOUD_ITEM_WITHDRAW_OK,
+                sender_id="SERVER",
+                target_id=player_id,
+                payload={"item_id": item_id, "quantity": quantity},
+            ),
+            player_id,
+        )
 
         await self.broadcast(
             NetworkMessage(
@@ -186,7 +194,7 @@ async def websocket_endpoint(websocket: WebSocket, player_id: str):
                     manager.player_states[player_id] = PlayerState(**state_data)
                     await manager.broadcast_player_list()
 
-            elif msg.type in (MessageType.CHALLENGE_REQ, MessageType.CHALLENGE_ACCEPT, MessageType.CHALLENGE_DECLINE, MessageType.BATTLE_READY):
+            elif msg.type in (MessageType.CHALLENGE_REQ, MessageType.CHALLENGE_ACCEPT, MessageType.CHALLENGE_DECLINE, MessageType.BATTLE_READY, MessageType.ITEM_GIFT):
                 # Route direct message to target player
                 if msg.target_id:
                     await manager.send_personal_message(msg, msg.target_id)

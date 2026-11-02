@@ -30,6 +30,9 @@ class NetworkEngine:
         self.on_challenge_received: Optional[Callable[[str, str, dict], None]] = None
         self.on_battle_ready: Optional[Callable[[str, bytes], None]] = None
         self.on_ledger_updated: Optional[Callable[[Dict[int, int]], None]] = None
+        self.on_deposit_success: Optional[Callable[[int, int], None]] = None
+        self.on_withdraw_success: Optional[Callable[[int, int], None]] = None
+        self.on_item_gift_received: Optional[Callable[[str, str, int, int], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
 
     async def connect(self, player_id: Optional[str] = None):
@@ -143,6 +146,42 @@ class NetworkEngine:
         )
         await self._send(msg)
 
+    async def request_deposit(self, item_id: int, quantity: int = 1) -> bool:
+        """Removes item from local in-game RAM first, then credits the Cloud Bank ledger."""
+        # 1. Mutate local in-game RAM first
+        success = await self.state.ram_deposit_item(item_id, quantity)
+        if not success:
+            if self.on_error:
+                self.on_error("Could not remove item from in-game RAM. Make sure GDB is started in mGBA.")
+            return False
+
+        # 2. Transmit deposit to server
+        await self.deposit_item(item_id, quantity)
+        if self.on_deposit_success:
+            self.on_deposit_success(item_id, quantity)
+        return True
+
+    async def send_item_gift(self, target_player_id: str, item_id: int, quantity: int = 1) -> bool:
+        """Removes item from local in-game RAM and sends it directly to another trainer."""
+        success = await self.state.ram_deposit_item(item_id, quantity)
+        if not success:
+            if self.on_error:
+                self.on_error("Could not remove item from in-game RAM. Make sure GDB is started.")
+            return False
+
+        msg = NetworkMessage(
+            type=MessageType.ITEM_GIFT,
+            sender_id=self.player_id,
+            target_id=target_player_id,
+            payload={
+                "trainer_name": self.state.player_name,
+                "item_id": item_id,
+                "quantity": quantity,
+            },
+        )
+        await self._send(msg)
+        return True
+
     async def deposit_item(self, item_id: int, quantity: int = 1):
         msg = NetworkMessage(
             type=MessageType.CLOUD_ITEM_DEPOSIT,
@@ -185,6 +224,31 @@ class NetworkEngine:
                         await self.state.inject_opponent_party(opp_bytes)
                         if self.on_battle_ready:
                             self.on_battle_ready(msg.sender_id, opp_bytes)
+
+                elif msg.type == MessageType.CLOUD_ITEM_WITHDRAW_OK:
+                    item_id = msg.payload.get("item_id")
+                    qty = msg.payload.get("quantity", 1)
+                    if item_id and qty > 0:
+                        # Attempt to inject into in-game RAM bag
+                        success = await self.state.ram_withdraw_item(item_id, qty)
+                        if not success:
+                            logger.error("Failed to inject item 0x%04X into RAM! Rolling back to cloud ledger.", item_id)
+                            # Rollback: deposit back into cloud escrow
+                            await self.deposit_item(item_id, qty)
+                            if self.on_error:
+                                self.on_error("In-game bag is full or invalid! Withdrawal rolled back to Cloud Bank.")
+                        else:
+                            if self.on_withdraw_success:
+                                self.on_withdraw_success(item_id, qty)
+
+                elif msg.type == MessageType.ITEM_GIFT:
+                    sender_name = msg.payload.get("trainer_name", "Trainer")
+                    item_id = msg.payload.get("item_id")
+                    qty = msg.payload.get("quantity", 1)
+                    if item_id and qty > 0:
+                        success = await self.state.ram_withdraw_item(item_id, qty)
+                        if success and self.on_item_gift_received:
+                            self.on_item_gift_received(msg.sender_id, sender_name, item_id, qty)
 
                 elif msg.type == MessageType.LEDGER_UPDATE:
                     ledger = msg.payload.get("ledger", {})

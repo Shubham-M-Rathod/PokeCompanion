@@ -46,3 +46,30 @@ def test_escrow_ledger_logic():
     can_withdraw = manager.cloud_ledger.get(test_item, 0) >= req_qty
     assert can_withdraw is False
 
+
+def test_server_manager_deposit_and_withdraw():
+    test_player = "test_player_1"
+    item = 0x006D  # Star Piece
+    manager.cloud_ledger.pop(item, None)
+
+    # 1. Deposit
+    try:
+        manager.handle_deposit(test_player, item, 2).send(None)
+    except StopIteration as e:
+        assert e.value is True
+    assert manager.cloud_ledger[item] == 2
+
+    # 2. Withdraw
+    try:
+        manager.handle_withdraw(test_player, item, 1).send(None)
+    except StopIteration as e:
+        assert e.value is True
+    assert manager.cloud_ledger[item] == 1
+
+    # 3. Overdraw rejection
+    try:
+        manager.handle_withdraw(test_player, item, 5).send(None)
+    except StopIteration as e:
+        assert e.value is False
+    assert manager.cloud_ledger[item] == 1
+
