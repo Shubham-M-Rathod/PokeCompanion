@@ -108,8 +108,8 @@ def main():
     sb1_addr = struct.unpack("<I", sb1_ptr_bytes)[0] if sb1_ptr_bytes else 0
     print(f"\n[5] SaveBlock1 (Pointer at 0x03005008): 0x{sb1_addr:08X}")
     if 0x02000000 <= sb1_addr <= 0x0203FFFF:
-        badge_b = read_bytes(s, sb1_addr + 0x1450, 1)
-        print(f"    Badges at SB1+0x1450: 0x{badge_b[0]:02X}" if badge_b else "    Badge read failed")
+        badge_b = read_bytes(s, sb1_addr + 0x0FE4, 1)
+        print(f"    Badges at SB1+0x0FE4: 0x{badge_b[0]:02X}" if badge_b else "    Badge read failed")
 
         bag_bytes_310 = read_bytes(s, sb1_addr + 0x0310, 40)
         print(f"    Raw Bag at SB1+0x0310 (40 bytes):\n      {bag_bytes_310.hex()}")

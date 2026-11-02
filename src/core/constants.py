@@ -13,7 +13,7 @@ class FireRedOffsets:
     OPPONENT_PARTY = 0x0202402C # 6 slots * 100 bytes = 600 bytes
     SAVE_BLOCK_1_PTR = 0x03005008
     SAVE_BLOCK_2_PTR = 0x0300500C # Contains Player Name, Gender, Trainer ID, SecurityKey
-    BADGE_FLAGS_OFFSET = 0x1450 # SaveBlock1 + 0x1450 (1 byte, 8 badge bits)
+    BADGE_FLAGS_OFFSET = 0x0FE4 # SaveBlock1 + 0x0FE4 (1 byte, 8 badge bits: FLAG_BADGE01_GET - FLAG_BADGE08_GET)
     BAG_POCKET_OFFSET = 0x0310  # SaveBlock1 + 0x0310 (Items pocket: 30 slots * 4 = 120 bytes)
     BAG_ITEMS_COUNT = 30        # FireRed items pocket capacity
     BAG_POKEBALLS_OFFSET = 0x0400 # SaveBlock1 + 0x0400 (Poké Balls pocket: 13 slots * 4 = 52 bytes)
