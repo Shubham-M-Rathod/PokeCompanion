@@ -11,6 +11,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.battle.items_data import get_battle_item_effect
 from src.battle.moves_data import MoveData, get_move_data
 from src.battle.pokedex_data import get_species_types
 from src.battle.type_chart import get_effectiveness_message, get_type_multiplier
@@ -157,9 +158,11 @@ class BattlePokemon:
 
 @dataclass
 class TurnAction:
-    action_type: str  # "FIGHT", "SWITCH", "FORFEIT"
+    action_type: str  # "FIGHT", "SWITCH", "ITEM", "FORFEIT"
     move_index: int = 0
     switch_index: int = 0
+    item_id: int = 0
+    target_index: int = 0
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "TurnAction":
@@ -167,6 +170,8 @@ class TurnAction:
             action_type=str(payload.get("action_type", "FIGHT")).upper(),
             move_index=int(payload.get("move_index", 0)),
             switch_index=int(payload.get("switch_index", 0)),
+            item_id=int(payload.get("item_id", 0)),
+            target_index=int(payload.get("target_index", 0)),
         )
 
 
@@ -287,13 +292,15 @@ class BattleSession:
         self.active_mon(self.p1_id).flinched = False
         self.active_mon(self.p2_id).flinched = False
 
-        # 1. Process SWITCH actions before FIGHT actions
+        # 1. Process SWITCH and ITEM actions before FIGHT actions (authentic GBA priority)
         actions = [(self.p1_id, p1_act), (self.p2_id, p2_act)]
         fight_queue: List[Tuple[str, TurnAction, MoveData]] = []
 
         for pid, act in actions:
             if act.action_type == "SWITCH":
                 self._perform_switch(pid, act.switch_index, events)
+            elif act.action_type == "ITEM":
+                self._perform_item(pid, act.item_id, act.target_index, events)
             else:
                 move = self._pick_move(pid, act.move_index)
                 fight_queue.append((pid, act, move))
@@ -345,6 +352,77 @@ class BattleSession:
         new_mon = self.active_mon(pid)
         new_mon.reset_volatiles()
         events.append(self._event(f"{self.names[pid]} sent out {new_mon.nickname}!", kind="switch", side=pid))
+
+    def _perform_item(self, pid: str, item_id: int, target_index: int, events: List[Dict[str, Any]]) -> None:
+        effect = get_battle_item_effect(item_id)
+        if not effect:
+            events.append(self._event(f"{self.names[pid]} tried an unusable item!"))
+            return
+
+        team = self.teams[pid]
+        idx = target_index if 0 <= target_index < len(team) else self.active_idx[pid]
+        target = team[idx]
+        events.append(self._event(f"{self.names[pid]} used {effect.name}!", kind="item", side=pid))
+
+        applied = False
+
+        # Revive fainted Pokemon
+        if effect.revive_ratio > 0:
+            if target.is_fainted:
+                target.hp = max(1, int(target.max_hp * effect.revive_ratio))
+                target.status = None
+                target.sleep_turns = 0
+                target.reset_volatiles()
+                events.append(self._event(f"{target.nickname} recovered from fainting! ({target.hp} HP)", kind="heal", side=pid))
+                applied = True
+            else:
+                events.append(self._event("It had no effect!"))
+            return
+
+        if target.is_fainted:
+            events.append(self._event("It had no effect!"))
+            return
+
+        # HP Recovery
+        if (effect.full_hp or effect.heal_hp > 0) and target.hp < target.max_hp:
+            old_hp = target.hp
+            target.hp = target.max_hp if effect.full_hp else min(target.max_hp, target.hp + effect.heal_hp)
+            gained = target.hp - old_hp
+            events.append(self._event(f"{target.nickname} restored {gained} HP!", kind="heal", side=pid))
+            applied = True
+
+        # Status Cure
+        if target.status and target.status in effect.cures_statuses:
+            old_status = target.status
+            target.status = None
+            target.sleep_turns = 0
+            target.toxic_counter = 0
+            events.append(self._event(f"{target.nickname} was cured of {old_status}!", kind="status", side=pid))
+            applied = True
+
+        if effect.cures_confusion and target.confused_turns > 0:
+            target.confused_turns = 0
+            events.append(self._event(f"{target.nickname} snapped out of confusion!", kind="status", side=pid))
+            applied = True
+
+        # PP Restoration
+        if effect.restore_pp > 0:
+            restored_any = False
+            for m_idx, move in enumerate(target.moves):
+                if target.pp[m_idx] < move.max_pp:
+                    target.pp[m_idx] = min(move.max_pp, target.pp[m_idx] + effect.restore_pp)
+                    restored_any = True
+            if restored_any:
+                events.append(self._event(f"{target.nickname}'s PP was restored!", kind="heal", side=pid))
+                applied = True
+
+        # Stat Stage Boosts (Active Pokemon only)
+        if effect.stat_boosts and idx == self.active_idx[pid]:
+            self._apply_stat_changes(pid, target, effect.stat_boosts, events)
+            applied = True
+
+        if not applied:
+            events.append(self._event("It had no effect!"))
 
     def _pick_move(self, pid: str, move_index: int) -> MoveData:
         mon = self.active_mon(pid)

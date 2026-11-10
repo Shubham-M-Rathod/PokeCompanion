@@ -161,8 +161,10 @@ class NetworkEngine:
         action_type: str,
         move_index: int = 0,
         switch_index: int = 0,
+        item_id: int = 0,
+        target_index: int = 0,
     ):
-        """Submits a PvP battle turn choice (FIGHT, SWITCH, or FORFEIT) to the server."""
+        """Submits a PvP battle turn choice (FIGHT, SWITCH, ITEM, or FORFEIT) to the server."""
         msg = NetworkMessage(
             type=MessageType.BATTLE_ACTION,
             sender_id=self.player_id,
@@ -171,6 +173,8 @@ class NetworkEngine:
                 "action_type": action_type,
                 "move_index": move_index,
                 "switch_index": switch_index,
+                "item_id": item_id,
+                "target_index": target_index,
             },
         )
         await self._send(msg)

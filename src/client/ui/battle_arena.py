@@ -8,7 +8,7 @@ Renders an authentic Game Boy Advance battle stage using:
   & Party Switcher + step-by-step GBA battle text playback.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QRectF, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPen, QPixmap
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.battle.items_data import get_battle_item_effect
 from src.battle.type_chart import TYPE_COLORS
 from src.client.ui.assets import AsyncImageLoader, pokemon_back_urls, pokemon_front_urls
 
@@ -303,7 +304,8 @@ class BattleStageWidget(QWidget):
 class BattleArenaWindow(QDialog):
     """Complete GBA-styled Live PvP Battle Arena synced with RelayManager."""
 
-    action_submitted = Signal(str, str, int, int)  # battle_id, action_type, move_idx, switch_idx
+    # battle_id, action_type, move_idx, switch_idx, item_id, target_idx
+    action_submitted = Signal(str, str, int, int, int, int)
 
     def __init__(self, image_loader: AsyncImageLoader, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -316,6 +318,8 @@ class BattleArenaWindow(QDialog):
 
         self.battle_id: str = ""
         self.current_state: Dict[str, Any] = {}
+        self._bag_items: List[Tuple[int, int, str]] = []
+        self._selected_item_id: int = 0
         self.player_sprite_url: str = ""
         self.opp_sprite_url: str = ""
         self.party_thumb_urls: Dict[int, str] = {}
@@ -354,23 +358,32 @@ class BattleArenaWindow(QDialog):
         self.lbl_dialog = QLabel("Battle starting...")
         self.lbl_dialog.setWordWrap(True)
         self.lbl_dialog.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.lbl_dialog.setMinimumHeight(135)
+        self.lbl_dialog.setMinimumHeight(115)
         self.lbl_dialog.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.lbl_dialog.setStyleSheet(
             "background-color: #28527a; color: #f8fafc; border: 3px solid #e2e8f0; "
             "border-radius: 8px; padding: 12px;"
         )
-        msg_vbox.addWidget(self.lbl_dialog)
+        msg_vbox.addWidget(self.lbl_dialog, stretch=1)
 
         self.txt_history = QTextEdit()
         self.txt_history.setReadOnly(True)
         self.txt_history.setVisible(False)
-        self.txt_history.setMinimumHeight(135)
+        self.txt_history.setMinimumHeight(115)
         self.txt_history.setFont(QFont("Consolas", 9))
         self.txt_history.setStyleSheet(
             "background-color: #0f172a; color: #e2e8f0; border: 2px solid #94a3b8; border-radius: 6px; padding: 6px;"
         )
-        msg_vbox.addWidget(self.txt_history)
+        msg_vbox.addWidget(self.txt_history, stretch=1)
+
+        self.btn_log = QPushButton("📜 View Battle Log")
+        self.btn_log.setFixedHeight(22)
+        self.btn_log.setStyleSheet(
+            "background-color: #334155; color: #e2e8f0; border: 1px solid #64748b; "
+            "border-radius: 4px; font-size: 10px; font-weight: bold;"
+        )
+        self.btn_log.clicked.connect(self._toggle_history_view)
+        msg_vbox.addWidget(self.btn_log)
 
         deck_layout.addWidget(msg_container, stretch=3)
 
@@ -380,25 +393,25 @@ class BattleArenaWindow(QDialog):
             "QStackedWidget { background-color: #f8fafc; border: 3px solid #94a3b8; border-radius: 8px; }"
         )
 
-        # Page 0: Main 2x2 GBA Menu
+        # Page 0: Classic 2x2 GBA Menu (FIGHT | BAG / POKEMON | RUN)
         self.page_main = QWidget()
         main_grid = QGridLayout(self.page_main)
         main_grid.setContentsMargins(8, 8, 8, 8)
         main_grid.setSpacing(6)
 
         self.btn_fight = self._menu_btn("⚔️ FIGHT", "#dc2626")
+        self.btn_bag = self._menu_btn("🎒 BAG", "#d97706")
         self.btn_pokemon = self._menu_btn("🔄 POKéMON", "#16a34a")
-        self.btn_log = self._menu_btn("📜 LOG", "#2563eb")
-        self.btn_run = self._menu_btn("🏳️ RUN", "#475569")
+        self.btn_run = self._menu_btn("🏳️ RUN", "#2563eb")
 
         self.btn_fight.clicked.connect(lambda: self.menu_stack.setCurrentIndex(1))
+        self.btn_bag.clicked.connect(self._open_bag_menu)
         self.btn_pokemon.clicked.connect(self._open_switch_menu)
-        self.btn_log.clicked.connect(self._toggle_history_view)
         self.btn_run.clicked.connect(self._confirm_forfeit)
 
         main_grid.addWidget(self.btn_fight, 0, 0)
-        main_grid.addWidget(self.btn_pokemon, 0, 1)
-        main_grid.addWidget(self.btn_log, 1, 0)
+        main_grid.addWidget(self.btn_bag, 0, 1)
+        main_grid.addWidget(self.btn_pokemon, 1, 0)
         main_grid.addWidget(self.btn_run, 1, 1)
         self.menu_stack.addWidget(self.page_main)
 
@@ -478,6 +491,55 @@ class BattleArenaWindow(QDialog):
         btn_close.clicked.connect(self.close)
         fin_vbox.addWidget(btn_close)
         self.menu_stack.addWidget(self.page_finished)
+
+        # Page 5: Battle Bag Items
+        self.page_bag = QWidget()
+        bag_vbox = QVBoxLayout(self.page_bag)
+        bag_vbox.setContentsMargins(6, 6, 6, 6)
+        bag_vbox.setSpacing(4)
+
+        bag_scroll = QScrollArea()
+        bag_scroll.setWidgetResizable(True)
+        self.bag_list_widget = QWidget()
+        self.bag_list_layout = QVBoxLayout(self.bag_list_widget)
+        self.bag_list_layout.setContentsMargins(2, 2, 2, 2)
+        self.bag_list_layout.setSpacing(4)
+        bag_scroll.setWidget(self.bag_list_widget)
+        bag_vbox.addWidget(bag_scroll)
+
+        btn_bag_back = QPushButton("← Back")
+        btn_bag_back.setFixedHeight(26)
+        btn_bag_back.setStyleSheet("background-color: #e2e8f0; color: #1e293b; font-weight: bold;")
+        btn_bag_back.clicked.connect(lambda: self.menu_stack.setCurrentIndex(0))
+        bag_vbox.addWidget(btn_bag_back)
+        self.menu_stack.addWidget(self.page_bag)
+
+        # Page 6: Bag Item Target Pokemon Picker
+        self.page_bag_target = QWidget()
+        bt_vbox = QVBoxLayout(self.page_bag_target)
+        bt_vbox.setContentsMargins(6, 6, 6, 6)
+        bt_vbox.setSpacing(4)
+
+        self.lbl_bag_target_hdr = QLabel("Use item on:")
+        self.lbl_bag_target_hdr.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        self.lbl_bag_target_hdr.setStyleSheet("color: #1e293b;")
+        bt_vbox.addWidget(self.lbl_bag_target_hdr)
+
+        bt_scroll = QScrollArea()
+        bt_scroll.setWidgetResizable(True)
+        self.bag_target_widget = QWidget()
+        self.bag_target_layout = QVBoxLayout(self.bag_target_widget)
+        self.bag_target_layout.setContentsMargins(2, 2, 2, 2)
+        self.bag_target_layout.setSpacing(4)
+        bt_scroll.setWidget(self.bag_target_widget)
+        bt_vbox.addWidget(bt_scroll)
+
+        btn_bt_back = QPushButton("← Back to Bag")
+        btn_bt_back.setFixedHeight(26)
+        btn_bt_back.setStyleSheet("background-color: #e2e8f0; color: #1e293b; font-weight: bold;")
+        btn_bt_back.clicked.connect(self._open_bag_menu)
+        bt_vbox.addWidget(btn_bt_back)
+        self.menu_stack.addWidget(self.page_bag_target)
 
         deck_layout.addWidget(self.menu_stack, stretch=2)
         root.addWidget(deck_frame, stretch=1)
@@ -703,6 +765,90 @@ class BattleArenaWindow(QDialog):
                 scaled = pixmap.scaled(32, 32, Qt.KeepAspectRatio, Qt.FastTransformation)
                 self.party_thumb_labels[idx].setPixmap(scaled)
 
+    def set_bag_items(self, bag_items: List[Tuple[int, int, str]]) -> None:
+        self._bag_items = list(bag_items)
+        if self.menu_stack.currentIndex() == 5:
+            self._populate_bag_items_list()
+
+    def _open_bag_menu(self) -> None:
+        self._populate_bag_items_list()
+        self.menu_stack.setCurrentIndex(5)
+
+    def _populate_bag_items_list(self) -> None:
+        while self.bag_list_layout.count():
+            item = self.bag_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        usable = []
+        for item_id, qty, name in self._bag_items:
+            eff = get_battle_item_effect(item_id)
+            if eff and qty > 0:
+                usable.append((item_id, qty, eff))
+
+        if not usable:
+            lbl_empty = QLabel("No usable battle items in your in-game Bag\n(Potions, Status Heals, Revives, X-Items).")
+            lbl_empty.setWordWrap(True)
+            lbl_empty.setAlignment(Qt.AlignCenter)
+            lbl_empty.setStyleSheet("color: #64748b; padding: 12px;")
+            self.bag_list_layout.addWidget(lbl_empty)
+            return
+
+        for item_id, qty, eff in usable:
+            btn = QPushButton(f"{eff.name}  x{qty}\n{eff.description}")
+            btn.setStyleSheet(
+                "QPushButton { background-color: #ffffff; color: #1e293b; text-align: left; "
+                "border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px; font-size: 10px; font-weight: bold; }"
+                "QPushButton:hover { border: 2px solid #d97706; background-color: #fffbeb; }"
+            )
+            btn.clicked.connect(lambda _, iid=item_id: self._open_item_target_picker(iid))
+            self.bag_list_layout.addWidget(btn)
+
+    def _is_item_applicable(self, eff, mon: Dict[str, Any], is_active: bool) -> bool:
+        fainted = mon.get("fainted", False)
+        if eff.revive_ratio > 0:
+            return fainted
+        if fainted:
+            return False
+        if eff.stat_boosts:
+            return is_active
+        needs_hp = (eff.full_hp or eff.heal_hp > 0) and mon.get("hp", 0) < mon.get("max_hp", 1)
+        needs_status = bool(mon.get("status")) and mon.get("status") in eff.cures_statuses
+        needs_pp = eff.restore_pp > 0 and any(m.get("pp", 0) < m.get("max_pp", 1) for m in mon.get("moves", []))
+        return needs_hp or needs_status or needs_pp or eff.cures_confusion
+
+    def _open_item_target_picker(self, item_id: int) -> None:
+        eff = get_battle_item_effect(item_id)
+        if not eff:
+            return
+        self._selected_item_id = item_id
+        self.lbl_bag_target_hdr.setText(f"Use {eff.name} on which Pokémon?")
+
+        while self.bag_target_layout.count():
+            item = self.bag_target_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        you_view = self.current_state.get("you", {})
+        active_idx = you_view.get("active_index", 0)
+        team = you_view.get("team", [])
+
+        for idx, mon in enumerate(team):
+            can_use = self._is_item_applicable(eff, mon, idx == active_idx)
+            status_tag = f" [{mon['status']}]" if mon.get("status") else (" [FNT]" if mon.get("fainted") else "")
+            btn = QPushButton(f"{mon['nickname']} Lv{mon['level']}{status_tag} — {mon['hp']}/{mon['max_hp']} HP")
+            btn.setEnabled(can_use)
+            btn.setStyleSheet(
+                "QPushButton { background-color: #ffffff; color: #1e293b; text-align: left; font-weight: bold; "
+                "border: 1px solid #cbd5e1; border-radius: 5px; padding: 6px; font-size: 10px; }"
+                "QPushButton:hover { border: 2px solid #16a34a; background-color: #f0fdf4; }"
+                "QPushButton:disabled { background-color: #e2e8f0; color: #94a3b8; }"
+            )
+            btn.clicked.connect(lambda _, t_idx=idx, iid=item_id: self._submit_item(iid, t_idx))
+            self.bag_target_layout.addWidget(btn)
+
+        self.menu_stack.setCurrentIndex(6)
+
     def _open_switch_menu(self) -> None:
         self.btn_switch_back.setVisible(True)
         self.menu_stack.setCurrentIndex(2)
@@ -711,7 +857,7 @@ class BattleArenaWindow(QDialog):
         show_hist = not self.txt_history.isVisible()
         self.txt_history.setVisible(show_hist)
         self.lbl_dialog.setVisible(not show_hist)
-        self.btn_log.setText("💬 DIALOG" if show_hist else "📜 LOG")
+        self.btn_log.setText("💬 Back to Battle Dialog" if show_hist else "📜 View Battle Log")
 
     def _submit_fight(self, move_index: int) -> None:
         if not self.battle_id:
@@ -719,7 +865,7 @@ class BattleArenaWindow(QDialog):
         self.menu_stack.setCurrentIndex(3)
         opp_name = self.current_state.get("opponent", {}).get("trainer_name", "Opponent")
         self.lbl_waiting.setText(f"⏳ Move chosen! Waiting for {opp_name}...")
-        self.action_submitted.emit(self.battle_id, "FIGHT", move_index, 0)
+        self.action_submitted.emit(self.battle_id, "FIGHT", move_index, 0, 0, 0)
 
     def _submit_switch(self, switch_index: int) -> None:
         if not self.battle_id:
@@ -727,7 +873,15 @@ class BattleArenaWindow(QDialog):
         self.menu_stack.setCurrentIndex(3)
         opp_name = self.current_state.get("opponent", {}).get("trainer_name", "Opponent")
         self.lbl_waiting.setText(f"⏳ Switch chosen! Waiting for {opp_name}...")
-        self.action_submitted.emit(self.battle_id, "SWITCH", 0, switch_index)
+        self.action_submitted.emit(self.battle_id, "SWITCH", 0, switch_index, 0, 0)
+
+    def _submit_item(self, item_id: int, target_index: int) -> None:
+        if not self.battle_id:
+            return
+        self.menu_stack.setCurrentIndex(3)
+        opp_name = self.current_state.get("opponent", {}).get("trainer_name", "Opponent")
+        self.lbl_waiting.setText(f"⏳ Using item... Waiting for {opp_name}...")
+        self.action_submitted.emit(self.battle_id, "ITEM", 0, 0, item_id, target_index)
 
     def _confirm_forfeit(self) -> None:
         reply = QMessageBox.question(
@@ -737,5 +891,5 @@ class BattleArenaWindow(QDialog):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes and self.battle_id:
-            self.action_submitted.emit(self.battle_id, "FORFEIT", 0, 0)
+            self.action_submitted.emit(self.battle_id, "FORFEIT", 0, 0, 0, 0)
 

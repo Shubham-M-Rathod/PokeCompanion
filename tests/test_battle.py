@@ -270,3 +270,41 @@ def test_burn_halves_physical_and_residual_damage():
     assert dmg_burned <= (dmg_normal // 2) + 1
 
 
+def test_battle_bag_items_heal_status_revive_and_priority():
+    p1_mon1 = _make_mon(8, "WARTORTLE", 30, 100, 40, [55])  # Water Gun
+    p1_mon1.hp = 20
+    p1_mon1.status = "PAR"
+    p1_mon2 = _make_mon(25, "PIKACHU", 25, 60, 90, [85])
+    p1_mon2.hp = 0  # Fainted reserve
+
+    p2_mon1 = _make_mon(16, "PIDGEY", 15, 60, 120, [33])  # Faster Tackle
+
+    session = BattleSession(
+        battle_id="b_item",
+        p1_id="p1",
+        p1_name="ASH",
+        p1_team=[p1_mon1, p1_mon2],
+        p2_id="p2",
+        p2_name="GARY",
+        p2_team=[p2_mon1],
+        rng=random.Random(7),
+    )
+
+    # Turn 1: P1 uses Full Restore (0x0013) on slot 0 while faster P2 uses Tackle.
+    # Item executes BEFORE P2's attack: Wartortle heals to 100 & cures PAR, then takes Tackle damage.
+    session.submit_action("p1", TurnAction("ITEM", item_id=0x0013, target_index=0))
+    res = session.submit_action("p2", TurnAction("FIGHT", move_index=0))
+    assert res is not None
+    events = [e["text"] for e in res["p1"]["events"]]
+    assert events.index("ASH used Full Restore!") < events.index("PIDGEY used Tackle!")
+    assert p1_mon1.status is None
+    assert p1_mon1.hp > 80  # Healed to 100, took small Tackle damage from Lv15 Pidgey
+
+    # Turn 2: P1 uses Revive (0x0018) on fainted Pikachu in slot 1 -> revived with half HP (30)
+    session.submit_action("p1", TurnAction("ITEM", item_id=0x0018, target_index=1))
+    session.submit_action("p2", TurnAction("FIGHT", move_index=0))
+    assert p1_mon2.is_fainted is False
+    assert p1_mon2.hp == 30
+
+
+

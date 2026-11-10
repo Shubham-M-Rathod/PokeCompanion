@@ -633,6 +633,8 @@ class MainWindow(QMainWindow):
 
         # 3. Update Local Bag Table (Scroll Preserved!)
         self._render_local_bag()
+        if self.arena_window:
+            self.arena_window.set_bag_items(self.state_mgr.bag_items)
 
     def _render_local_bag(self):
         search_query = self.input_search.text().strip().lower()
@@ -984,6 +986,7 @@ class MainWindow(QMainWindow):
     def _handle_battle_started(self, battle_state: dict):
         arena = self._ensure_arena_window()
         self.btn_open_arena.setEnabled(True)
+        arena.set_bag_items(self.state_mgr.bag_items)
         arena.start_battle(battle_state)
         arena.show()
         arena.raise_()
@@ -995,11 +998,41 @@ class MainWindow(QMainWindow):
         if payload.get("phase") == "FINISHED":
             self._update_battle_status_ui("🏁 Live Battle finished! Ready for next challenge.", False, 800)
 
-    def _send_arena_action(self, battle_id: str, action_type: str, move_index: int, switch_index: int):
-        asyncio.run_coroutine_threadsafe(
-            self.net.send_battle_action(battle_id, action_type, move_index, switch_index),
-            self.loop,
-        )
+    def _send_arena_action(
+        self,
+        battle_id: str,
+        action_type: str,
+        move_index: int,
+        switch_index: int,
+        item_id: int,
+        target_index: int,
+    ):
+        async def _dispatch():
+            if action_type == "ITEM" and item_id > 0:
+                ok = await self.state_mgr.ram_deposit_item(item_id, 1)
+                if not ok:
+                    self.signals.activity_logged.emit("⚠️ Could not consume item from mGBA RAM!", "error")
+                    if self.arena_window and self.arena_window.current_state:
+                        self.signals.battle_turn_result.emit({
+                            **self.arena_window.current_state,
+                            "events": [{"text": "Could not consume item from mGBA bag!"}],
+                        })
+                    return
+                self.signals.activity_logged.emit(
+                    f"🎒 Used {get_item_name(item_id)} in battle (deducted from mGBA RAM).", "info"
+                )
+                self.signals.state_updated.emit()
+
+            await self.net.send_battle_action(
+                battle_id,
+                action_type,
+                move_index=move_index,
+                switch_index=switch_index,
+                item_id=item_id,
+                target_index=target_index,
+            )
+
+        asyncio.run_coroutine_threadsafe(_dispatch(), self.loop)
 
     def _focus_arena_window(self):
         if self.arena_window:
