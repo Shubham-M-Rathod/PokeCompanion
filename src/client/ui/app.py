@@ -1,7 +1,8 @@
 """PokeCompanion NetBridge - Desktop Companion UI (PySide6).
 
 Live Gen 3 GBA sidecar multiplayer companion:
-- Tab 1: Trainer Profile, Gym Badges, Live 6-Pokémon Party, and Online Relay Lobby.
+- Tab 1: Trainer Profile, Gym Badges with online badge icons, Live 6-Pokémon Party
+  with sprite avatars from open-source PokeAPI CDN, and Online Relay Lobby.
 - Tab 2: In-Game Bag & Shared Cloud Bank with smooth scrolling, search filtering,
   and 1-click quick deposit/withdraw buttons.
 - High-contrast, eye-friendly layout compatible with both dark and light modes.
@@ -10,6 +11,7 @@ Live Gen 3 GBA sidecar multiplayer companion:
 import asyncio
 import datetime
 import logging
+import struct
 import sys
 import threading
 from typing import Dict, List, Optional, Tuple
@@ -17,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -30,7 +32,6 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
-    QProgressBar,
     QGroupBox,
     QMessageBox,
     QInputDialog,
@@ -38,12 +39,14 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QComboBox,
     QTextEdit,
-    QFrame,
+    QGraphicsOpacityEffect,
 )
 
 from src.memory.gdb_client import GDBClient
 from src.client.state import GameStateManager, BADGE_NAMES_KANTO
 from src.client.net import NetworkEngine
+from src.client.ui.assets import AsyncImageLoader, KANTO_BADGE_URLS, pokemon_front_urls
+from src.client.ui.battle_arena import BattleArenaWindow
 from src.core.items import get_item_name, get_item_pocket
 
 
@@ -51,25 +54,49 @@ class BridgeSignals(QObject):
     state_updated = Signal()
     players_updated = Signal(object)
     challenge_received = Signal(str, str, object)
+    challenge_declined = Signal(str, str)
     battle_ready = Signal(str, bytes)
+    battle_started = Signal(object)
+    battle_turn_result = Signal(object)
+    battle_status_changed = Signal(str, bool, int)  # text, is_armed, poll_interval_ms
     ledger_updated = Signal(object)
-    connection_status = Signal(str, str)  # component, status
-    activity_logged = Signal(str, str)    # message, level ('info', 'success', 'warning', 'error')
-    notification = Signal(str, str)       # title, message (for modals)
+    connection_status = Signal(str, str)
+    activity_logged = Signal(str, str)
+    notification = Signal(str, str)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, gdb_host: str = "127.0.0.1", gdb_port: int = 2345, server_url: str = "ws://127.0.0.1:8000"):
+    def __init__(
+        self,
+        gdb_host: str = "127.0.0.1",
+        gdb_port: int = 2345,
+        server_url: str = "ws://127.0.0.1:8000",
+        player_id: Optional[str] = None,
+    ):
         super().__init__()
-        self.setWindowTitle("PokeCompanion NetBridge - Gen 3 Sidecar (FireRed / Emerald)")
-        self.resize(1080, 780)
+        self.resize(1100, 780)
         self.setMinimumSize(960, 660)
 
         # Core Engines
         self.signals = BridgeSignals()
         self.gdb = GDBClient(host=gdb_host, port=gdb_port)
         self.state_mgr = GameStateManager(self.gdb)
-        self.net = NetworkEngine(self.state_mgr, server_url=server_url)
+        self.net = NetworkEngine(self.state_mgr, server_url=server_url, player_id=player_id)
+        self.setWindowTitle(
+            f"PokeCompanion NetBridge - [{self.net.player_id} | mGBA :{gdb_port}]"
+        )
+
+        # Armed Battle Injection State (FR-5)
+        self._armed_opponent_bytes: Optional[bytes] = None
+        self._armed_opponent_id: str = ""
+        self._armed_expected_pid: int = 0
+        self._armed_battle_active: bool = False
+
+        # Async Asset Loader
+        self.image_loader = AsyncImageLoader()
+        self.image_loader.image_loaded.connect(self._on_image_loaded)
+        self._slot_avatar_urls: Dict[int, str] = {}
+        self._badge_urls: Dict[int, str] = {}
 
         # State Caches for intelligent table diffing (prevents scroll resetting)
         self._last_ledger: Dict[int, int] = {}
@@ -82,11 +109,18 @@ class MainWindow(QMainWindow):
         self.bg_thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self.bg_thread.start()
 
+        # Arena window (created lazily on BATTLE_START)
+        self.arena_window: Optional[BattleArenaWindow] = None
+
         # Connect signals
         self.signals.state_updated.connect(self._render_state)
         self.signals.players_updated.connect(self._render_lobby)
         self.signals.challenge_received.connect(self._handle_incoming_challenge)
+        self.signals.challenge_declined.connect(self._handle_challenge_declined)
         self.signals.battle_ready.connect(self._handle_battle_ready)
+        self.signals.battle_started.connect(self._handle_battle_started)
+        self.signals.battle_turn_result.connect(self._handle_battle_turn_result)
+        self.signals.battle_status_changed.connect(self._update_battle_status_ui)
         self.signals.ledger_updated.connect(self._render_ledger)
         self.signals.connection_status.connect(self._update_status)
         self.signals.activity_logged.connect(self._append_activity_log)
@@ -95,7 +129,10 @@ class MainWindow(QMainWindow):
         # Wire NetEngine callbacks
         self.net.on_player_list_changed = lambda pl: self.signals.players_updated.emit(pl)
         self.net.on_challenge_received = lambda cid, cname, p: self.signals.challenge_received.emit(cid, cname, p)
+        self.net.on_challenge_declined = lambda did, dname: self.signals.challenge_declined.emit(did, dname)
         self.net.on_battle_ready = lambda cid, pbytes: self.signals.battle_ready.emit(cid, pbytes)
+        self.net.on_battle_started = lambda payload: self.signals.battle_started.emit(payload)
+        self.net.on_battle_turn_result = lambda payload: self.signals.battle_turn_result.emit(payload)
         self.net.on_ledger_updated = lambda ldg: self.signals.ledger_updated.emit(ldg)
 
         self.net.on_deposit_success = lambda iid, q: (
@@ -158,6 +195,7 @@ class MainWindow(QMainWindow):
     async def _do_poll(self):
         try:
             await self.state_mgr.update_all()
+            await self._check_armed_battle()
             self.signals.connection_status.emit("GDB", f"Connected ({self.state_mgr.game_code or 'GBA'})")
             self.signals.state_updated.emit()
             if self.net.is_running:
@@ -166,6 +204,39 @@ class MainWindow(QMainWindow):
             self.signals.connection_status.emit("GDB", "Disconnected (Start GDB in mGBA)")
         finally:
             self._is_polling = False
+
+    async def _check_armed_battle(self):
+        """Auto-injects armed opponent party right as an in-game battle begins (gBattleTypeFlags != 0)."""
+        armed_bytes = self._armed_opponent_bytes
+        if not armed_bytes:
+            return
+
+        flags = self.state_mgr.battle_type_flags
+        if flags != 0:
+            if not self._armed_battle_active:
+                self._armed_battle_active = True
+                self.signals.battle_status_changed.emit(
+                    f"🔥 LIVE BATTLE vs {self._armed_opponent_id} (Watching Enemy RAM)",
+                    True,
+                    120,
+                )
+
+            if self.state_mgr.opponent_first_pid != self._armed_expected_pid:
+                ok = await self.state_mgr.inject_opponent_party(armed_bytes)
+                if ok:
+                    self.signals.activity_logged.emit(
+                        f"⚔️ Battle init detected (flags=0x{flags:X}) -> Injected {self._armed_opponent_id}'s team!",
+                        "success",
+                    )
+        else:
+            if self._armed_battle_active:
+                opp_id = self._armed_opponent_id
+                self._armed_opponent_bytes = None
+                self._armed_opponent_id = ""
+                self._armed_expected_pid = 0
+                self._armed_battle_active = False
+                self.signals.activity_logged.emit(f"🏁 Battle vs {opp_id} finished.", "info")
+                self.signals.battle_status_changed.emit("Idle (Challenge a trainer in the lobby)", False, 800)
 
     def _setup_ui(self):
         central = QWidget()
@@ -182,16 +253,20 @@ class MainWindow(QMainWindow):
         self.lbl_relay_status = QLabel("🌐 Relay Server: Connecting...")
         self.lbl_relay_status.setFont(QFont("Segoe UI", 10, QFont.Bold))
 
+        self.lbl_client_id = QLabel(f"🪪 Client ID: {self.net.player_id}")
+        self.lbl_client_id.setFont(QFont("Segoe UI", 10, QFont.Bold))
+
         top_bar.addWidget(self.lbl_gdb_status)
         top_bar.addSpacing(20)
         top_bar.addWidget(self.lbl_relay_status)
+        top_bar.addSpacing(20)
+        top_bar.addWidget(self.lbl_client_id)
         top_bar.addStretch()
         main_layout.addLayout(top_bar)
 
         # Tabs Layout
         self.tabs = QTabWidget()
-        font_tab = QFont("Segoe UI", 10, QFont.Bold)
-        self.tabs.setFont(font_tab)
+        self.tabs.setFont(QFont("Segoe UI", 10, QFont.Bold))
         main_layout.addWidget(self.tabs, stretch=1)
 
         # Tab 1: 👤 Player & Pokémon Party
@@ -226,27 +301,56 @@ class MainWindow(QMainWindow):
         self.lbl_game_code.setFont(QFont("Segoe UI", 11, QFont.Bold))
 
         info_row.addWidget(self.lbl_trainer_name)
-        info_row.addSpacing(15)
+        info_row.addSpacing(20)
         info_row.addWidget(self.lbl_trainer_id)
-        info_row.addSpacing(15)
+        info_row.addSpacing(20)
         info_row.addWidget(self.lbl_game_code)
         info_row.addStretch()
         trainer_box_layout.addLayout(info_row)
 
-        # Line 2: Badges Row
+        # Line 2: Badges Row with Visual Badge Icons
         badges_row = QHBoxLayout()
         badges_lbl = QLabel("Gym Badges (0/8):")
         badges_lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
         badges_row.addWidget(badges_lbl)
         self.lbl_badge_summary = badges_lbl
+        badges_row.addSpacing(10)
 
-        self.badge_labels = []
-        for name in BADGE_NAMES_KANTO:
-            b_lbl = QLabel(f"[ {name} ]")
-            b_lbl.setFont(QFont("Segoe UI", 9, QFont.Bold))
-            b_lbl.setStyleSheet("color: #718096; padding: 2px 4px;")
-            badges_row.addWidget(b_lbl)
-            self.badge_labels.append(b_lbl)
+        self.badge_widgets = []
+        for i, name in enumerate(BADGE_NAMES_KANTO):
+            badge_card = QWidget()
+            b_layout = QHBoxLayout(badge_card)
+            b_layout.setContentsMargins(3, 1, 3, 1)
+            b_layout.setSpacing(4)
+
+            # Badge Image Label
+            lbl_icon = QLabel()
+            lbl_icon.setFixedSize(26, 26)
+            lbl_icon.setAlignment(Qt.AlignCenter)
+
+            # Opacity effect for dimming unearned badges
+            opacity = QGraphicsOpacityEffect(lbl_icon)
+            opacity.setOpacity(0.25)
+            lbl_icon.setGraphicsEffect(opacity)
+
+            # Badge Name
+            lbl_text = QLabel(f"○ {name}")
+            lbl_text.setFont(QFont("Segoe UI", 9))
+            lbl_text.setStyleSheet("color: #718096;")
+
+            b_layout.addWidget(lbl_icon)
+            b_layout.addWidget(lbl_text)
+            badges_row.addWidget(badge_card)
+
+            self.badge_widgets.append({
+                "icon": lbl_icon,
+                "text": lbl_text,
+                "opacity": opacity,
+            })
+
+            # Pre-fetch badge icon URL
+            self._badge_urls[i] = KANTO_BADGE_URLS[i]
+            self.image_loader.fetch(KANTO_BADGE_URLS[i])
 
         badges_row.addStretch()
         trainer_box_layout.addLayout(badges_row)
@@ -256,7 +360,7 @@ class MainWindow(QMainWindow):
         mid_layout = QHBoxLayout()
         mid_layout.setSpacing(8)
 
-        # Left: Live Party 6-Slot Grid
+        # Left: Live Party 6-Slot Grid with Sprite Avatars
         party_box = QGroupBox("Live Player Party (Decrypted RAM: 0x02024284)")
         party_layout = QVBoxLayout(party_box)
         self.party_slot_widgets = []
@@ -265,20 +369,36 @@ class MainWindow(QMainWindow):
         grid.setSpacing(6)
         for i in range(6):
             slot_card = QGroupBox(f"Party Slot {i+1}")
-            slot_vbox = QVBoxLayout(slot_card)
-            slot_vbox.setContentsMargins(8, 8, 8, 8)
-            slot_vbox.setSpacing(4)
+            slot_hbox = QHBoxLayout(slot_card)
+            slot_hbox.setContentsMargins(6, 6, 6, 6)
+            slot_hbox.setSpacing(8)
+
+            # Pokémon Avatar Sprite on Left
+            lbl_avatar = QLabel()
+            lbl_avatar.setFixedSize(54, 54)
+            lbl_avatar.setAlignment(Qt.AlignCenter)
+            lbl_avatar.setStyleSheet("background-color: rgba(0,0,0,0.04); border-radius: 6px; font-size: 20px;")
+            lbl_avatar.setText("⚪")
+            slot_hbox.addWidget(lbl_avatar)
+
+            # Info Details on Right
+            slot_vbox = QVBoxLayout()
+            slot_vbox.setSpacing(3)
+            slot_vbox.setAlignment(Qt.AlignVCenter)
 
             lbl_name = QLabel("Empty Slot")
             lbl_name.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            lbl_name.setWordWrap(True)
 
             lbl_level = QLabel("Level: --")
             lbl_level.setFont(QFont("Segoe UI", 9))
 
             slot_vbox.addWidget(lbl_name)
             slot_vbox.addWidget(lbl_level)
+            slot_hbox.addLayout(slot_vbox)
 
             self.party_slot_widgets.append({
+                "avatar": lbl_avatar,
                 "name": lbl_name,
                 "level": lbl_level,
             })
@@ -301,6 +421,36 @@ class MainWindow(QMainWindow):
         self.table_players.verticalHeader().setVisible(False)
         self.table_players.setAlternatingRowColors(True)
         lobby_layout.addWidget(self.table_players)
+
+        # Active Battle Broker Status Bar
+        battle_box = QGroupBox("⚔️ Active Battle Broker")
+        battle_vbox = QVBoxLayout(battle_box)
+        battle_vbox.setContentsMargins(6, 6, 6, 6)
+        battle_vbox.setSpacing(4)
+
+        self.lbl_battle_status = QLabel("Idle (Challenge a trainer in the lobby)")
+        self.lbl_battle_status.setWordWrap(True)
+        self.lbl_battle_status.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        battle_vbox.addWidget(self.lbl_battle_status)
+
+        battle_btn_row = QHBoxLayout()
+        self.btn_open_arena = QPushButton("🎮 Open Battle Arena")
+        self.btn_open_arena.setEnabled(False)
+        self.btn_open_arena.clicked.connect(self._focus_arena_window)
+        battle_btn_row.addWidget(self.btn_open_arena)
+
+        self.btn_reinject_team = QPushButton("💉 Inject to RAM")
+        self.btn_reinject_team.setEnabled(False)
+        self.btn_reinject_team.clicked.connect(self._reinject_armed_team)
+        battle_btn_row.addWidget(self.btn_reinject_team)
+
+        self.btn_disarm_battle = QPushButton("✖ Clear")
+        self.btn_disarm_battle.setEnabled(False)
+        self.btn_disarm_battle.clicked.connect(self._disarm_battle)
+        battle_btn_row.addWidget(self.btn_disarm_battle)
+
+        battle_vbox.addLayout(battle_btn_row)
+        lobby_layout.addWidget(battle_box)
 
         mid_layout.addWidget(lobby_box, stretch=2)
         layout.addLayout(mid_layout, stretch=1)
@@ -400,8 +550,21 @@ class MainWindow(QMainWindow):
         log_vbox.addWidget(self.activity_log)
         layout.addWidget(log_box, stretch=1)
 
+    def _on_image_loaded(self, url: str, pixmap: QPixmap):
+        """Asynchronously updates avatars and badge icons when images arrive."""
+        # 1. Check Party Slots
+        for slot_idx, slot_url in self._slot_avatar_urls.items():
+            if slot_url == url and slot_idx < len(self.party_slot_widgets):
+                scaled = pixmap.scaled(52, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.party_slot_widgets[slot_idx]["avatar"].setPixmap(scaled)
+
+        # 2. Check Badge Icons
+        for badge_idx, badge_url in self._badge_urls.items():
+            if badge_url == url and badge_idx < len(self.badge_widgets):
+                scaled = pixmap.scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.badge_widgets[badge_idx]["icon"].setPixmap(scaled)
+
     def _on_bag_filter_changed(self):
-        """Forces an update of both bag tables when search or pocket filter changes."""
         self._last_rendered_bag_cache = None
         self._last_rendered_cloud_cache = None
         self._render_local_bag()
@@ -417,7 +580,6 @@ class MainWindow(QMainWindow):
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         self.activity_log.append(f"[{now_str}] {message}")
 
-        # Show brief non-blocking toast
         self.lbl_bag_toast.setText(message)
         self.lbl_bag_toast.setVisible(True)
         QTimer.singleShot(4000, lambda: self.lbl_bag_toast.setVisible(False))
@@ -434,33 +596,45 @@ class MainWindow(QMainWindow):
         self.lbl_game_code.setText(f"Game: {game}")
         self.lbl_badge_summary.setText(f"Gym Badges ({badge_count}/8):")
 
-        # Update 8 Badges
+        # Update 8 Badges (with Icon & Opacity Highlight)
         for i, has_badge in enumerate(self.state_mgr.badges):
             b_name = BADGE_NAMES_KANTO[i]
-            lbl = self.badge_labels[i]
+            widgets = self.badge_widgets[i]
             if has_badge:
-                lbl.setText(f"✓ {b_name}")
-                lbl.setStyleSheet("color: #10b981; font-weight: bold; padding: 2px 4px;")
+                widgets["text"].setText(f"✓ {b_name}")
+                widgets["text"].setStyleSheet("color: #10b981; font-weight: bold;")
+                widgets["opacity"].setOpacity(1.0)
             else:
-                lbl.setText(f"○ {b_name}")
-                lbl.setStyleSheet("color: #a0aec0; font-weight: normal; padding: 2px 4px;")
+                widgets["text"].setText(f"○ {b_name}")
+                widgets["text"].setStyleSheet("color: #a0aec0; font-weight: normal;")
+                widgets["opacity"].setOpacity(0.25)
 
-        # 2. Update 6 Party Slots
+        # 2. Update 6 Party Slots (Avatar Sprite on Left, Nickname & Level on Right)
         for i in range(6):
             widgets = self.party_slot_widgets[i]
             if i < len(self.state_mgr.party):
                 mon = self.state_mgr.party[i]
-                widgets["name"].setText(f"{mon.nickname} ({mon.species_name})")
+                widgets["name"].setText(f"{mon.nickname}\n({mon.species_name})")
                 widgets["level"].setText(f"Level: {mon.level}")
+
+                # Fetch official sprite avatar from PokeAPI CDN (FRLG with default fallback)
+                if mon.species > 0:
+                    urls = pokemon_front_urls(mon.species)
+                    sprite_url = urls[0]
+                    if self._slot_avatar_urls.get(i) != sprite_url:
+                        self._slot_avatar_urls[i] = sprite_url
+                        self.image_loader.fetch(sprite_url, urls[1:])
             else:
-                widgets["name"].setText(f"Slot {i+1} (Empty)")
+                widgets["name"].setText(f"Slot {i+1}\n(Empty)")
                 widgets["level"].setText("Level: --")
+                widgets["avatar"].clear()
+                widgets["avatar"].setText("⚪")
+                self._slot_avatar_urls.pop(i, None)
 
         # 3. Update Local Bag Table (Scroll Preserved!)
         self._render_local_bag()
 
     def _render_local_bag(self):
-        """Renders local bag items with search filtering, pocket filter, and scroll preservation."""
         search_query = self.input_search.text().strip().lower()
         pocket_choice = self.combo_pocket.currentText()
 
@@ -475,14 +649,12 @@ class MainWindow(QMainWindow):
                 continue
             filtered_items.append((item_id, qty, item_name, pocket))
 
-        # Check if identical to last rendered cache
         current_cache = (search_query, pocket_choice, tuple(filtered_items))
         if current_cache == self._last_rendered_bag_cache:
-            return  # DO NOT rebuild table if data didn't change! This keeps scrolling smooth.
+            return
 
         self._last_rendered_bag_cache = current_cache
 
-        # Preserve scrollbar position
         v_bar = self.table_local_bag.verticalScrollBar()
         prev_scroll = v_bar.value()
 
@@ -532,7 +704,6 @@ class MainWindow(QMainWindow):
 
             self.table_local_bag.setCellWidget(row, 3, act_widget)
 
-        # Restore scroll position
         v_bar.setValue(prev_scroll)
 
     def _render_ledger(self, ledger: dict):
@@ -540,7 +711,6 @@ class MainWindow(QMainWindow):
         self._render_cloud_bag()
 
     def _render_cloud_bag(self):
-        """Renders cloud bank items with search filtering, pocket filter, and scroll preservation."""
         search_query = self.input_search.text().strip().lower()
         pocket_choice = self.combo_pocket.currentText()
 
@@ -637,7 +807,8 @@ class MainWindow(QMainWindow):
             row = self.table_players.rowCount()
             self.table_players.insertRow(row)
 
-            self.table_players.setItem(row, 0, QTableWidgetItem(p.get("trainer_name", "Trainer")))
+            trainer_label = f"{p.get('trainer_name', 'Trainer')} ({pid})"
+            self.table_players.setItem(row, 0, QTableWidgetItem(trainer_label))
             self.table_players.setItem(row, 1, QTableWidgetItem(p.get("game_code", "BPRE")))
             self.table_players.setItem(row, 2, QTableWidgetItem(f"{p.get('badges_count', 0)}/8"))
 
@@ -751,7 +922,7 @@ class MainWindow(QMainWindow):
             return
         asyncio.run_coroutine_threadsafe(self.net.send_challenge(target_id), self.loop)
         self.signals.activity_logged.emit(f"⚔️ Sent battle challenge to {target_id}. Waiting for response...", "info")
-        QMessageBox.information(self, "Challenge Sent", f"Battle challenge sent to {target_id}! Waiting for acceptance...")
+        self._update_battle_status_ui(f"⏳ Challenge sent to {target_id} — waiting for acceptance...", False, 800)
 
     def _handle_incoming_challenge(self, challenger_id: str, challenger_name: str, payload: dict):
         reply = QMessageBox.question(
@@ -761,26 +932,110 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
+            if not self.state_mgr.party:
+                QMessageBox.warning(
+                    self,
+                    "No Party",
+                    "Cannot accept battle: your in-game party is empty or mGBA is disconnected.",
+                )
+                asyncio.run_coroutine_threadsafe(self.net.decline_challenge(challenger_id), self.loop)
+                return
             opp_b64 = payload.get("party_b64", "")
             asyncio.run_coroutine_threadsafe(
                 self.net.accept_challenge(challenger_id, opp_b64), self.loop
             )
-            self.signals.activity_logged.emit(f"⚔️ Accepted battle challenge from {challenger_name}!", "success")
+            self.signals.activity_logged.emit(f"⚔️ Accepted battle challenge from {challenger_name} ({challenger_id})!", "success")
         else:
             asyncio.run_coroutine_threadsafe(self.net.decline_challenge(challenger_id), self.loop)
-            self.signals.activity_logged.emit(f"Declined battle challenge from {challenger_name}.", "info")
+            self.signals.activity_logged.emit(f"Declined battle challenge from {challenger_name} ({challenger_id}).", "info")
+
+    def _handle_challenge_declined(self, decliner_id: str, decliner_name: str):
+        self.signals.activity_logged.emit(f"❌ {decliner_name} ({decliner_id}) declined your battle challenge.", "warning")
+        self._update_battle_status_ui(f"❌ {decliner_name} ({decliner_id}) declined your challenge.", False, 800)
 
     def _handle_battle_ready(self, opponent_id: str, opponent_bytes: bytes):
+        opp_count = 0
+        for idx in range(6):
+            pid = struct.unpack_from("<I", opponent_bytes, idx * 100)[0]
+            if pid != 0:
+                opp_count += 1
+
+        self._armed_opponent_bytes = opponent_bytes
+        self._armed_opponent_id = opponent_id
+        self._armed_expected_pid = struct.unpack_from("<I", opponent_bytes, 0)[0]
+        self._armed_battle_active = False
+
+        status_txt = (
+            f"⚔️ Live Battle vs {opponent_id} ({opp_count} Pokémon) — "
+            f"GBA Arena active (mGBA RAM also armed!)"
+        )
+        self._update_battle_status_ui(status_txt, True, 200)
         self.signals.activity_logged.emit(
-            f"⚔️ Battle Ready! Opponent lineup ({len(opponent_bytes)} bytes) injected into Enemy Party RAM!",
+            f"⚔️ Battle Ready vs {opponent_id} ({opp_count} Pokémon).",
             "success",
         )
-        QMessageBox.information(
-            self,
-            "Battle Ready!",
-            f"Opponent's 600-byte team injected into Opponent Party RAM (0x{self.state_mgr.offsets.OPPONENT_PARTY:08X})!\n\n"
-            f"Talk to a trainer or enter a Link Battle in mGBA to fight their actual lineup!",
+
+    def _ensure_arena_window(self) -> BattleArenaWindow:
+        if self.arena_window is None:
+            self.arena_window = BattleArenaWindow(self.image_loader, parent=self)
+            self.arena_window.action_submitted.connect(self._send_arena_action)
+        return self.arena_window
+
+    def _handle_battle_started(self, battle_state: dict):
+        arena = self._ensure_arena_window()
+        self.btn_open_arena.setEnabled(True)
+        arena.start_battle(battle_state)
+        arena.show()
+        arena.raise_()
+        arena.activateWindow()
+
+    def _handle_battle_turn_result(self, payload: dict):
+        arena = self._ensure_arena_window()
+        arena.apply_turn_result(payload)
+        if payload.get("phase") == "FINISHED":
+            self._update_battle_status_ui("🏁 Live Battle finished! Ready for next challenge.", False, 800)
+
+    def _send_arena_action(self, battle_id: str, action_type: str, move_index: int, switch_index: int):
+        asyncio.run_coroutine_threadsafe(
+            self.net.send_battle_action(battle_id, action_type, move_index, switch_index),
+            self.loop,
         )
+
+    def _focus_arena_window(self):
+        if self.arena_window:
+            self.arena_window.show()
+            self.arena_window.raise_()
+            self.arena_window.activateWindow()
+
+    def _update_battle_status_ui(self, status_text: str, is_armed: bool, poll_interval_ms: int):
+        self.lbl_battle_status.setText(status_text)
+        self.btn_reinject_team.setEnabled(is_armed)
+        self.btn_disarm_battle.setEnabled(is_armed)
+        if self.poll_timer.interval() != poll_interval_ms:
+            self.poll_timer.setInterval(poll_interval_ms)
+
+    def _reinject_armed_team(self):
+        if not self._armed_opponent_bytes:
+            return
+        armed_bytes = self._armed_opponent_bytes
+        opp_id = self._armed_opponent_id
+
+        async def _do_inject():
+            ok = await self.state_mgr.inject_opponent_party(armed_bytes)
+            if ok:
+                self.signals.activity_logged.emit(f"💉 Manually injected {opp_id}'s team into Enemy Party RAM!", "success")
+            else:
+                self.signals.activity_logged.emit("⚠️ Manual team injection failed (check mGBA GDB connection).", "error")
+
+        asyncio.run_coroutine_threadsafe(_do_inject(), self.loop)
+
+    def _disarm_battle(self):
+        self._armed_opponent_bytes = None
+        self._armed_opponent_id = ""
+        self._armed_expected_pid = 0
+        self._armed_battle_active = False
+        self._update_battle_status_ui("Idle (Challenge a trainer in the lobby)", False, 800)
+        self.signals.activity_logged.emit("Disarmed pending battle injection.", "info")
 
     def _show_notification(self, title: str, message: str):
         QMessageBox.information(self, title, message)
@@ -792,9 +1047,19 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def main():
+def main(
+    gdb_host: str = "127.0.0.1",
+    gdb_port: int = 2345,
+    server_url: str = "ws://127.0.0.1:8000",
+    player_id: Optional[str] = None,
+):
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(
+        gdb_host=gdb_host,
+        gdb_port=gdb_port,
+        server_url=server_url,
+        player_id=player_id,
+    )
     window.show()
     sys.exit(app.exec())
 

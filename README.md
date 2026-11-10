@@ -15,17 +15,18 @@ Instead of synchronizing overworld cycles or patching ROM files, the game runs c
        ▲
        │  GDB Remote Protocol (TCP localhost:2345)
        ▼
-[ Python Client Companion ] (PySide6 / PyQt6 UI)
+[ Python Client Companion ] (PySide6 UI)
   ├── Memory Engine: GDB client reading/writing RAM; XOR crypt & 16-bit checksum
-  ├── State Manager: Local party, badges, and bag caches
-  └── Net Engine: WebSocket client exchanging JSON payloads
+  ├── State Manager: Local party, badges, and multi-pocket bag caches
+  ├── Net Engine: WebSocket client exchanging JSON payloads
+  └── GBA Battle Arena: FireRed-styled turn-based PvP battle stage & HUD
        ▲
        │  WebSockets (JSON over TLS/TCP)
        ▼
 [ Central Relay Server ] (Python FastAPI / asyncio)
   ├── Session/Lobby Manager: Tracks connected users, badges, and team rosters
-  ├── Battle Broker: Dispatches challenge requests and relays 600-byte party data
-  └── Cloud Bank Service: Atomic escrow ledger for shared items (SQLite/JSON)
+  ├── Battle Broker & PvP Engine (`src/battle/`): Dispatches challenges, resolves Gen 3 PvP turns authoritatively, and relays 600-byte party data
+  └── Cloud Bank Service: Atomic escrow ledger for shared items
 
 ```
 
@@ -38,8 +39,9 @@ Instead of synchronizing overworld cycles or patching ROM files, the game runs c
 
 2. **Client-Server WebSocket Protocol**:
 * `SYNC_STATE`: Client sends local player ID, badge bitflags, and decrypted party summary.
-* `CHALLENGE_REQ` / `CHALLENGE_ACCEPT`: Relays active 6-mon party data between two clients.
-* `CLOUD_ITEM_DEPOSIT` / `CLOUD_ITEM_WITHDRAW`: Atomic request/ack loop for shared inventory transfers.
+* `CHALLENGE_REQ` / `CHALLENGE_ACCEPT` / `CHALLENGE_DECLINE`: Relays active 600-byte party data between two clients.
+* `BATTLE_START` / `BATTLE_ACTION` / `BATTLE_TURN_RESULT`: Authoritative Gen 3 human-vs-human turn resolution using both trainers' live mGBA parties (moves, stats, STAB, 17-type effectiveness, critical hits, status effects, and switches).
+* `CLOUD_ITEM_DEPOSIT` / `CLOUD_ITEM_WITHDRAW` / `ITEM_GIFT`: Atomic request/ack loop for shared inventory transfers and P2P item gifting.
 
 
 
@@ -51,10 +53,10 @@ Instead of synchronizing overworld cycles or patching ROM files, the game runs c
 
 * **ROM Game Code Check (`0x080000AC`)**: 4-byte ASCII string (`BPRE` for FireRed US, `BPEE` for Emerald US).
 * **Player Party (`600 bytes`)**: `0x02024284` (FireRed) / `0x020244EC` (Emerald). Contains 6 slots of 100 bytes each.
-* **Opponent/Enemy Party (`600 bytes`)**: `0x0202402C` (FireRed) / `0x02024744` (Emerald). Used to inject opposing teams for battles.
+* **Opponent/Enemy Party (`600 bytes`)**: `0x0202402C` (FireRed) / `0x02024744` (Emerald). Used to inject opposing teams for optional in-game AI mirror battles.
 * **SaveBlock1 Pointer**: `0x03005008` (FireRed) / `0x03005D8C` (Emerald).
-* **Badge Flags**: `SaveBlock1 + 0x1450` (1 byte, 8 badge bits).
-* **Bag Pocket**: `SaveBlock1 + 0x0310` (FireRed) / `SaveBlock1 + 0x0560` (Emerald). Stored as an array of `[u16 item_id, u16 quantity]`.
+* **Badge Flags**: `SaveBlock1 + 0x0FE4` (FireRed `FLAG_BADGE01_GET`–`FLAG_BADGE08_GET`, 1 byte, 8 badge bits) / `SaveBlock1 + 0x1450` (Emerald).
+* **Bag Pockets**: `SaveBlock1 + 0x0310` Items + `0x0400` Poké Balls (FireRed, XOR-encrypted with `SaveBlock2 + 0x0F20 & 0xFFFF`) / `SaveBlock1 + 0x0560` (Emerald).
 
 
 
@@ -92,10 +94,10 @@ Each 100-byte Pokémon slot contains:
 * *Withdraw*: Server validates item availability, decrements server ledger, and client injects item ID + quantity into an empty bag slot in RAM.
 
 
-* **FR-5: Battle Request & Team Injection**:
+* **FR-5: Live PvP Battle Arena & Optional RAM Team Injection**:
 * Player A challenges Player B via UI; Player B accepts.
-* Player A’s 600-byte party data is transmitted to Player B via WebSocket.
-* Player B's client writes the 600 bytes directly into the Opponent Party address (`0x0202402C` on FireRed) and triggers/engages an in-game trainer battle to fight Player A's actual lineup.
+* Both players' live 600-byte parties are decoded on the Relay Server (`src/battle/engine.py`) to launch an authoritative **GBA-styled Turn-Based PvP Battle Arena** (`src/client/ui/battle_arena.py`) where both humans pick moves/switches turn-by-turn with Gen 3 type effectiveness, STAB, crits, and status conditions.
+* Additionally, each client optionally injects the opponent's 600-byte team into `OPPONENT_PARTY` (`0x0202402C` on FireRed) for in-game AI mirror battles.
 
 
 
@@ -108,3 +110,24 @@ Each 100-byte Pokémon slot contains:
 * **NFR-5: Performance**: Local memory polling cycle must execute in under 20 ms. Remote challenge events must propagate in under 200 ms over WebSockets.
 
 ---
+
+## 5. Running & Local 2-Player Testing
+
+1. Open two separate **mGBA** instances (ideally with separate ROM/save copies) and start **Tools ➔ Start GDB Server...** on port `2345` (mGBA #1) and port `2346` (mGBA #2).
+2. Start the Relay Server:
+   ```powershell
+   .\venv\Scripts\python launch_server.py
+   ```
+3. Launch two Companion Clients:
+   ```powershell
+   .\venv\Scripts\python launch_client.py --gdb-port 2345 --player-id p1
+   .\venv\Scripts\python launch_client.py --gdb-port 2346 --player-id p2
+   ```
+4. Click **⚔️ Battle!** in `p1` and accept in `p2` to open the live GBA Battle Arena on both clients.
+
+### Battle Module Architecture (`src/battle/`)
+* `src/battle/type_chart.py`: Gen 3 17-type effectiveness chart & Physical/Special category split by type.
+* `src/battle/pokedex_data.py`: Gen 3 species typing lookup.
+* `src/battle/moves_data.py`: Gen 3 move definitions (power, accuracy, PP, priority, status effects, stat stages, drain, recoil).
+* `src/battle/engine.py`: Pure, framework-agnostic `BattleSession` turn resolver.
+* `src/client/ui/battle_arena.py`: FireRed-styled PySide6 Battle Stage, sprite HUD, move grid, and party switcher.

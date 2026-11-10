@@ -7,12 +7,15 @@ Handles:
 """
 
 import asyncio
+import base64
 import json
 import logging
-from typing import Dict, Optional
+import uuid
+from typing import Dict, Optional, Tuple
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.battle.engine import BattleSession, TurnAction, parse_party_for_battle
 from src.server.models import MessageType, NetworkMessage, PlayerState
 
 logger = logging.getLogger("NetBridgeRelay")
@@ -40,6 +43,10 @@ class RelayManager:
             0x000D: 5,  # 5 Potions initial public pool
             0x0004: 10, # 10 Poké Balls initial public pool
         }
+        # Pending challenges: (challenger_id, target_id) -> {"trainer_name": ..., "party_b64": ...}
+        self.pending_challenges: Dict[Tuple[str, str], Dict[str, str]] = {}
+        # Active live PvP BattleSessions: battle_id -> BattleSession
+        self.battles: Dict[str, BattleSession] = {}
 
     async def connect(self, player_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -61,6 +68,24 @@ class RelayManager:
             del self.active_connections[player_id]
         if player_id in self.player_states:
             del self.player_states[player_id]
+
+        # Auto-forfeit any active PvP battle if player disconnects
+        for bid, session in list(self.battles.items()):
+            if player_id in (session.p1_id, session.p2_id):
+                result = session.submit_action(player_id, TurnAction(action_type="FORFEIT"))
+                if result:
+                    opp_id = session.opponent_of(player_id)
+                    await self.send_personal_message(
+                        NetworkMessage(
+                            type=MessageType.BATTLE_TURN_RESULT,
+                            sender_id="SERVER",
+                            target_id=opp_id,
+                            payload=result[opp_id],
+                        ),
+                        opp_id,
+                    )
+                self.battles.pop(bid, None)
+
         logger.info("Player %s disconnected. Total online: %d", player_id, len(self.active_connections))
         await self.broadcast(
             NetworkMessage(
@@ -152,6 +177,79 @@ class RelayManager:
         )
         return True
 
+    async def start_battle_session(
+        self, challenger_id: str, accepter_id: str, accepter_name: str, accepter_party_b64: str
+    ) -> Optional[BattleSession]:
+        """Creates an authoritative BattleSession from both players' 600-byte RAM parties and notifies both."""
+        pending = self.pending_challenges.pop((challenger_id, accepter_id), None)
+        if not pending or not pending.get("party_b64") or not accepter_party_b64:
+            return None
+
+        try:
+            p1_bytes = base64.b64decode(pending["party_b64"])
+            p2_bytes = base64.b64decode(accepter_party_b64)
+            p1_team = parse_party_for_battle(p1_bytes)
+            p2_team = parse_party_for_battle(p2_bytes)
+        except Exception as e:
+            logger.error("Could not decode parties for live battle: %s", e)
+            return None
+
+        if not p1_team or not p2_team:
+            return None
+
+        battle_id = uuid.uuid4().hex[:8]
+        p1_name = pending.get("trainer_name", challenger_id)
+        p2_name = accepter_name or accepter_id
+        session = BattleSession(
+            battle_id=battle_id,
+            p1_id=challenger_id,
+            p1_name=p1_name,
+            p1_team=p1_team,
+            p2_id=accepter_id,
+            p2_name=p2_name,
+            p2_team=p2_team,
+        )
+        self.battles[battle_id] = session
+        logger.info("Started BattleSession %s: %s vs %s", battle_id, challenger_id, accepter_id)
+
+        for pid in (challenger_id, accepter_id):
+            await self.send_personal_message(
+                NetworkMessage(
+                    type=MessageType.BATTLE_START,
+                    sender_id="SERVER",
+                    target_id=pid,
+                    payload=session.get_view_for(pid),
+                ),
+                pid,
+            )
+        return session
+
+    async def handle_battle_action(self, player_id: str, payload: dict) -> None:
+        """Processes a player's turn action and dispatches resolved turn events to both players."""
+        battle_id = payload.get("battle_id")
+        session = self.battles.get(battle_id)
+        if not session:
+            return
+
+        action = TurnAction.from_dict(payload)
+        result = session.submit_action(player_id, action)
+        if result is None:
+            return
+
+        for pid in (session.p1_id, session.p2_id):
+            await self.send_personal_message(
+                NetworkMessage(
+                    type=MessageType.BATTLE_TURN_RESULT,
+                    sender_id="SERVER",
+                    target_id=pid,
+                    payload=result[pid],
+                ),
+                pid,
+            )
+
+        if session.phase == "FINISHED":
+            self.battles.pop(battle_id, None)
+
 
 manager = RelayManager()
 
@@ -194,7 +292,33 @@ async def websocket_endpoint(websocket: WebSocket, player_id: str):
                     manager.player_states[player_id] = PlayerState(**state_data)
                     await manager.broadcast_player_list()
 
-            elif msg.type in (MessageType.CHALLENGE_REQ, MessageType.CHALLENGE_ACCEPT, MessageType.CHALLENGE_DECLINE, MessageType.BATTLE_READY, MessageType.ITEM_GIFT):
+            elif msg.type == MessageType.CHALLENGE_REQ:
+                if msg.target_id:
+                    manager.pending_challenges[(player_id, msg.target_id)] = {
+                        "trainer_name": msg.payload.get("trainer_name", player_id),
+                        "party_b64": msg.payload.get("party_b64", ""),
+                    }
+                    await manager.send_personal_message(msg, msg.target_id)
+
+            elif msg.type == MessageType.CHALLENGE_ACCEPT:
+                if msg.target_id:
+                    await manager.send_personal_message(msg, msg.target_id)
+                    await manager.start_battle_session(
+                        challenger_id=msg.target_id,
+                        accepter_id=player_id,
+                        accepter_name=msg.payload.get("trainer_name", player_id),
+                        accepter_party_b64=msg.payload.get("party_b64", ""),
+                    )
+
+            elif msg.type == MessageType.CHALLENGE_DECLINE:
+                if msg.target_id:
+                    manager.pending_challenges.pop((msg.target_id, player_id), None)
+                    await manager.send_personal_message(msg, msg.target_id)
+
+            elif msg.type == MessageType.BATTLE_ACTION:
+                await manager.handle_battle_action(player_id, msg.payload)
+
+            elif msg.type in (MessageType.BATTLE_READY, MessageType.ITEM_GIFT):
                 # Route direct message to target player
                 if msg.target_id:
                     await manager.send_personal_message(msg, msg.target_id)

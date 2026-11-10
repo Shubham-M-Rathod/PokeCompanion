@@ -1,5 +1,6 @@
 """Starts the PokeCompanion Desktop UI Companion."""
 
+import argparse
 import socket
 from src.client.ui.app import main
 
@@ -36,10 +37,22 @@ def unfreeze_mgba(host: str = "127.0.0.1", port: int = 2345) -> None:
             pass
         s.close()
         print(f"[mGBA] Unfroze mGBA on {host}:{port} ($c)!")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[mGBA] Note: Could not connect to GDB on {host}:{port} ({e}).")
 
 
 if __name__ == "__main__":
-    unfreeze_mgba()
-    main()
+    parser = argparse.ArgumentParser(description="PokeCompanion NetBridge Companion Client")
+    parser.add_argument("--gdb-host", default="127.0.0.1", help="mGBA GDB host (default: 127.0.0.1)")
+    parser.add_argument("--gdb-port", type=int, default=2345, help="mGBA GDB port (default: 2345)")
+    parser.add_argument("--server-url", default="ws://127.0.0.1:8000", help="Relay server WebSocket URL")
+    parser.add_argument("--player-id", default=None, help="Optional player ID label (e.g., p1, p2)")
+    args = parser.parse_args()
+
+    unfreeze_mgba(args.gdb_host, args.gdb_port)
+    main(
+        gdb_host=args.gdb_host,
+        gdb_port=args.gdb_port,
+        server_url=args.server_url,
+        player_id=args.player_id,
+    )

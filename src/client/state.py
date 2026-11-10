@@ -234,6 +234,8 @@ class GameStateManager:
         self.party: List[Pokemon] = []
         self.bag_items: List[Tuple[int, int, str]] = []
         self.raw_party_bytes: bytes = b"\x00" * TOTAL_PARTY_SIZE
+        self.battle_type_flags: int = 0
+        self.opponent_first_pid: int = 0
 
     async def detect_game_version(self) -> str:
         """Reads ROM header at 0x080000AC to determine game version (FR-1)."""
@@ -456,6 +458,24 @@ class GameStateManager:
                 logger.error("Error modifying RAM bag for withdrawal: %s", e)
                 return False
 
+    async def poll_battle_state(self) -> None:
+        """Reads gBattleTypeFlags and current enemy slot-0 PID for battle start detection."""
+        battle_flags_addr = getattr(self.offsets, "BATTLE_TYPE_FLAGS", 0)
+        if not battle_flags_addr:
+            self.battle_type_flags = 0
+            self.opponent_first_pid = 0
+            return
+        try:
+            flags_bytes = await self.gdb.read_memory(battle_flags_addr, 4)
+            self.battle_type_flags = struct.unpack("<I", flags_bytes)[0]
+            if self.battle_type_flags != 0:
+                opp_pid_bytes = await self.gdb.read_memory(self.offsets.OPPONENT_PARTY, 4)
+                self.opponent_first_pid = struct.unpack("<I", opp_pid_bytes)[0]
+            else:
+                self.opponent_first_pid = 0
+        except Exception as e:
+            logger.debug("Could not read battle state: %s", e)
+
     async def update_all(self) -> None:
         """Executes a full polling cycle inside a single non-blocking GDB transaction."""
         async with self.gdb.transaction():
@@ -466,6 +486,7 @@ class GameStateManager:
             await self.poll_party()
             await self.poll_badges()
             await self.poll_bag()
+            await self.poll_battle_state()
 
     async def inject_opponent_party(self, opponent_party_600_bytes: bytes) -> bool:
         """Injects a 600-byte party into Opponent Party RAM in 100-byte chunks (FR-5)."""

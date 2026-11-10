@@ -18,17 +18,25 @@ logger = logging.getLogger(__name__)
 
 
 class NetworkEngine:
-    def __init__(self, state_mgr: GameStateManager, server_url: str = "ws://127.0.0.1:8000"):
+    def __init__(
+        self,
+        state_mgr: GameStateManager,
+        server_url: str = "ws://127.0.0.1:8000",
+        player_id: Optional[str] = None,
+    ):
         self.state = state_mgr
         self.server_url = server_url
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_running = False
-        self.player_id: str = f"trainer_{id(self) % 10000}"
+        self.player_id: str = player_id or f"trainer_{id(self) % 10000}"
 
         # Callbacks for GUI or Event Loop
         self.on_player_list_changed: Optional[Callable[[List[dict]], None]] = None
         self.on_challenge_received: Optional[Callable[[str, str, dict], None]] = None
+        self.on_challenge_declined: Optional[Callable[[str, str], None]] = None
         self.on_battle_ready: Optional[Callable[[str, bytes], None]] = None
+        self.on_battle_started: Optional[Callable[[dict], None]] = None
+        self.on_battle_turn_result: Optional[Callable[[dict], None]] = None
         self.on_ledger_updated: Optional[Callable[[Dict[int, int]], None]] = None
         self.on_deposit_success: Optional[Callable[[int, int], None]] = None
         self.on_withdraw_success: Optional[Callable[[int, int], None]] = None
@@ -143,6 +151,27 @@ class NetworkEngine:
             type=MessageType.CHALLENGE_DECLINE,
             sender_id=self.player_id,
             target_id=challenger_id,
+            payload={"trainer_name": self.state.player_name},
+        )
+        await self._send(msg)
+
+    async def send_battle_action(
+        self,
+        battle_id: str,
+        action_type: str,
+        move_index: int = 0,
+        switch_index: int = 0,
+    ):
+        """Submits a PvP battle turn choice (FIGHT, SWITCH, or FORFEIT) to the server."""
+        msg = NetworkMessage(
+            type=MessageType.BATTLE_ACTION,
+            sender_id=self.player_id,
+            payload={
+                "battle_id": battle_id,
+                "action_type": action_type,
+                "move_index": move_index,
+                "switch_index": switch_index,
+            },
         )
         await self._send(msg)
 
@@ -224,6 +253,19 @@ class NetworkEngine:
                         await self.state.inject_opponent_party(opp_bytes)
                         if self.on_battle_ready:
                             self.on_battle_ready(msg.sender_id, opp_bytes)
+
+                elif msg.type == MessageType.CHALLENGE_DECLINE:
+                    decliner_name = msg.payload.get("trainer_name", msg.sender_id)
+                    if self.on_challenge_declined:
+                        self.on_challenge_declined(msg.sender_id, decliner_name)
+
+                elif msg.type == MessageType.BATTLE_START:
+                    if self.on_battle_started:
+                        self.on_battle_started(msg.payload)
+
+                elif msg.type == MessageType.BATTLE_TURN_RESULT:
+                    if self.on_battle_turn_result:
+                        self.on_battle_turn_result(msg.payload)
 
                 elif msg.type == MessageType.CLOUD_ITEM_WITHDRAW_OK:
                     item_id = msg.payload.get("item_id")

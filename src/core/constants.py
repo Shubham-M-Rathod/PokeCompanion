@@ -11,6 +11,7 @@ class FireRedOffsets:
     OPPONENT_PARTY_COUNT = 0x0202402A # 1 byte u8
     PLAYER_PARTY = 0x02024284   # 6 slots * 100 bytes = 600 bytes
     OPPONENT_PARTY = 0x0202402C # 6 slots * 100 bytes = 600 bytes
+    BATTLE_TYPE_FLAGS = 0x02022B4C # u32 gBattleTypeFlags (0 = overworld, non-zero = in battle/transition)
     SAVE_BLOCK_1_PTR = 0x03005008
     SAVE_BLOCK_2_PTR = 0x0300500C # Contains Player Name, Gender, Trainer ID, SecurityKey
     BADGE_FLAGS_OFFSET = 0x0FE4 # SaveBlock1 + 0x0FE4 (1 byte, 8 badge bits: FLAG_BADGE01_GET - FLAG_BADGE08_GET)
